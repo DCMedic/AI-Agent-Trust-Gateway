@@ -8,13 +8,14 @@ The gateway does **not** assume that a model is malicious. It assumes something 
 
 ## v0.2 trust model
 
-AATG v0.2 separates three different kinds of authority that are often collapsed into one in agent systems:
+AATG v0.2 separates several forms of authority that are often collapsed into one in agent systems:
 
 1. **Static policy** answers whether an agent class is ever permitted to propose an action.
 2. **Capability authority** delegates short-lived, cryptographically signed permission for a specific agent/tool/action/argument envelope.
-3. **Human approval** authorizes one exact high-impact proposal and is consumed after one use.
+3. **Risk budget** limits cumulative authority exercised by an agent inside a sliding time window.
+4. **Human approval** authorizes one exact high-impact proposal and is consumed after one use.
 
-Passing one layer does not bypass the others. A high-risk action can therefore require policy permission, a valid capability, and a fresh human approval before execution.
+Passing one layer does not bypass the others. A high-risk action can therefore require policy permission, a valid capability, available risk budget, and a fresh human approval before execution.
 
 ## Security invariants
 
@@ -23,14 +24,15 @@ Passing one layer does not bypass the others. A high-risk action can therefore r
 3. **Least authority.** Authorization is evaluated per agent, tool, action, argument envelope, and risk tier.
 4. **Delegation is explicit.** Medium/high-risk authority can be represented by short-lived HMAC-signed capabilities.
 5. **Capabilities are scoped.** Tokens are bound to subject, audience, tool, action, expiration, and optional argument constraints.
-6. **High-impact actions require human approval.** Approval is bound to the exact proposal digest and expires.
-7. **Approvals are single use.** Replaying an already consumed approval is blocked and audited.
-8. **Argument constraints are enforced twice.** Static policy and delegated capability constraints can independently restrict parameters.
-9. **Policy is evaluated before execution.** Tool adapters cannot bypass the decision point.
-10. **Every decision is auditable.** Proposal, policy, capability, approval, execution, denial, replay, and verification events are written to a hash-chained journal.
-11. **Tool output is not automatically trusted.** Results carry provenance/taint labels until independent verification resolves what it actually can prove.
-12. **Verification does not erase provenance.** A verified result can still remain tainted as stored user content, simulated state, or external tool output.
-13. **Failures fail closed.** Policy, capability, approval, adapter, or verification errors do not silently become success.
+6. **Cumulative impact is bounded.** Sliding-window risk budgets prevent a sequence of individually permitted actions from silently becoming excessive authority.
+7. **High-impact actions require human approval.** Approval is bound to the exact proposal digest and expires.
+8. **Approvals are single use.** Replaying an already consumed approval is blocked and audited.
+9. **Argument constraints are enforced twice.** Static policy and delegated capability constraints can independently restrict parameters.
+10. **Policy is evaluated before execution.** Tool adapters cannot bypass the decision point.
+11. **Every decision is auditable.** Proposal, policy, capability, budget, approval, execution, denial, replay, and verification events are written to a hash-chained journal.
+12. **Tool output is not automatically trusted.** Results carry provenance/taint labels until independent verification resolves what it actually can prove.
+13. **Verification does not erase provenance.** A verified result can still remain tainted as stored user content, simulated state, or external tool output.
+14. **Failures fail closed.** Policy, capability, budget, approval, adapter, or verification errors do not silently become success.
 
 ## Architecture
 
@@ -46,6 +48,7 @@ Passing one layer does not bypass the others. A high-risk action can therefore r
 | capability verification    |
 | argument constraints       |
 | risk classification        |
+| cumulative risk budget     |
 | single-use approval ledger |
 | hash-chained audit journal |
 +-------------+--------------+
@@ -70,6 +73,17 @@ Passing one layer does not bypass the others. A high-risk action can therefore r
 `CapabilityIssuer` implements a deliberately small reference capability format using HMAC-SHA256. Each token contains a unique identifier, subject, audience, tool, action, issuance/expiration time, and optional argument constraints.
 
 Capabilities are **delegated authority**, not authentication by themselves. Production deployments should bind issuance to a mature workload identity system, KMS/HSM-protected signing keys, rotation, revocation, and durable replay controls.
+
+## Risk budgets
+
+`RiskBudget` adds a sliding-window authority budget per agent. The reference implementation assigns low-risk actions a cost of `0`, medium-risk actions a cost of `1`, and high-risk actions a cost of `3`.
+
+The purpose is to address sequence risk. A single action may be appropriate while a burst of repeated actions is not. The gateway therefore asks both:
+
+- Is this action individually authorized?
+- Has this agent already exercised too much authority recently?
+
+The current budget state is intentionally in-memory for research clarity. A production deployment would require durable, shared state across replicas.
 
 ## Human approvals
 
@@ -111,6 +125,7 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 pytest
 python tools/run_scenarios.py
+python tools/evaluate_redteam.py
 uvicorn trust_gateway.app:app --reload
 ```
 
@@ -124,7 +139,19 @@ Do not use an application environment variable as the long-term signing-key stra
 
 ## Adversarial evaluation
 
-The regression suite and scenario harness exercise cases including:
+The project includes two complementary evaluation paths.
+
+`tools/run_scenarios.py` provides a readable adversarial demonstration of policy denial, delegated capability checks, proposal-bound approval, approval replay prevention, taint propagation, tool failure, and audit integrity.
+
+`tools/evaluate_redteam.py` runs a labeled benign/adversarial corpus and emits a machine-readable JSON report with:
+
+- `adversarial_containment_rate`
+- `benign_completion_rate`
+- `total_pass_rate`
+
+CI fails if either adversarial containment or benign completion drops below `1.0` for the current reference corpus. The corpus is intentionally small and deterministic; the important contribution is the evaluation interface and the separation of safety containment from useful task completion.
+
+Current regression coverage includes:
 
 - unknown agent requesting a tool
 - known agent attempting an unauthorized action
@@ -133,6 +160,7 @@ The regression suite and scenario harness exercise cases including:
 - capability subject/scope mismatch
 - capability argument expansion
 - capability tampering and expiration
+- cumulative risk-budget exhaustion
 - high-impact action without approval
 - approval bound to a modified proposal
 - single-use approval replay
@@ -142,7 +170,7 @@ The regression suite and scenario harness exercise cases including:
 - MCP output without an independent verifier
 - audit-chain integrity validation
 
-The objective is not merely to demonstrate successful agent behavior. The project is designed to make unsafe, ambiguous, over-privileged, and replayed behavior observable and containable.
+The objective is not merely to demonstrate successful agent behavior. The project is designed to make unsafe, ambiguous, over-privileged, cumulative, and replayed behavior observable and containable.
 
 ## Documentation
 
@@ -156,7 +184,7 @@ This project explores a central question in trustworthy agentic systems:
 
 > **How much authority should an AI system possess directly, and what evidence should be required before its requested actions are allowed to produce external effects?**
 
-Next research milestones include durable capability revocation, cryptographic workload identity, risk budgets, dual-control approval, live MCP integration, information-flow policy, independent verification providers, policy differential testing, and a scored red-team evaluation corpus.
+Next research milestones include durable capability revocation, cryptographic workload identity, dual-control approval, live MCP integration, information-flow policy, independent verification providers, policy differential testing, richer sequence attacks, and a larger reproducible red-team corpus.
 
 ## Scope
 
