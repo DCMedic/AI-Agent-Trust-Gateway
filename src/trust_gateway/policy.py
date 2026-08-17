@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .information_flow import InformationFlowPolicy
 from .models import ActionProposal, Decision, PolicyDecision, RiskTier
 from .policy_bundle import PolicyBundleVerifier, PolicyProvenance
 
@@ -15,10 +16,12 @@ class PolicyEngine:
         *,
         verifier: PolicyBundleVerifier | None = None,
         require_signed_bundle: bool = False,
+        information_flow: InformationFlowPolicy | None = None,
     ):
         self.policy_path = Path(policy_path)
         raw = json.loads(self.policy_path.read_text(encoding="utf-8"))
         self.provenance: PolicyProvenance | None = None
+        self.information_flow = information_flow or InformationFlowPolicy()
 
         if raw.get("schema") == "aatg.policy-bundle.v1":
             if verifier is None:
@@ -62,6 +65,12 @@ class PolicyEngine:
         risk = RiskTier(action_rule.get("risk", "high"))
         if constraint_errors:
             return self._decision(Decision.DENY, risk, constraint_errors)
+
+        if proposal.evidence_taints:
+            flow = self.information_flow.evaluate(proposal.evidence_taints, risk)
+            if not flow.allowed:
+                reasons = [reason.replace("blocked_taint:", "tainted_evidence_blocked:") for reason in flow.reasons]
+                return self._decision(Decision.DENY, risk, reasons)
 
         if action_rule.get("requires_approval", False):
             return self._decision(
