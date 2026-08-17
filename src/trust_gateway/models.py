@@ -64,3 +64,4 @@ class ExecutionResult(BaseModel):
     verified: bool = False
     output_taints: list[str] = Field(default_factory=list)
     capability_id: str | None = None
+    identity_assertion_id: str | None = None
