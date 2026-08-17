@@ -24,3 +24,5 @@ jobs:
         run: pytest -q
       - name: Run adversarial scenarios
         run: python tools/run_scenarios.py
+      - name: Run scored red-team evaluation
+        run: python tools/evaluate_redteam.py
