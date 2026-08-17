@@ -28,3 +28,5 @@ jobs:
         run: python tools/evaluate_redteam.py
       - name: Run live MCP adversarial lab
         run: python lab/run_live_lab.py
+      - name: Run policy differential evaluation
+        run: python tools/evaluate_policy_differential.py
