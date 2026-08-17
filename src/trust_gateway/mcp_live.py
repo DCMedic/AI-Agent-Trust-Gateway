@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
-import subprocess
-from typing import Any, Sequence
+from typing import Any
+from urllib import error, request
 
 
-MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_PROTOCOL_VERSION = "2026-07-28"
+CLIENT_INFO_KEY = "io.modelcontextprotocol/clientInfo"
 
 
 class MCPProtocolError(RuntimeError):
     pass
+
+
+class MCPTrustError(RuntimeError):
+    pass
+
+
+def canonical_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -19,6 +31,18 @@ class MCPToolDescriptor:
     description: str
     input_schema: dict[str, Any]
     metadata_taints: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MCPToolPin:
+    name: str
+    input_schema_digest: str
+
+
+@dataclass(frozen=True)
+class MCPServerPin:
+    server_id: str
+    tools: dict[str, MCPToolPin]
 
 
 @dataclass(frozen=True)
@@ -31,12 +55,7 @@ class LiveMCPResult:
 
 
 class MCPMetadataGuard:
-    """Treat server-supplied tool metadata as untrusted discovery data.
-
-    Tool descriptions can influence model behavior but cannot grant authority. The
-    guard detects common instruction/exfiltration language so the lab can measure
-    whether discovery metadata is safely separated from authorization.
-    """
+    """Treat server-supplied descriptions as untrusted discovery content."""
 
     suspicious_fragments = (
         "ignore previous",
@@ -56,7 +75,7 @@ class MCPMetadataGuard:
     def inspect(self, tool: dict[str, Any]) -> MCPToolDescriptor:
         description = str(tool.get("description", ""))
         lowered = description.lower()
-        taints = []
+        taints: list[str] = []
         if any(fragment in lowered for fragment in self.suspicious_fragments):
             taints.append("suspicious_tool_metadata")
         return MCPToolDescriptor(
@@ -67,114 +86,60 @@ class MCPMetadataGuard:
         )
 
 
-class StdioMCPClient:
-    """Minimal MCP 2025-06-18 stdio client used by the adversarial lab.
+class StatelessHTTPMCPClient:
+    """Dependency-light MCP 2026-07-28 client for the adversarial lab.
 
-    The client implements lifecycle initialization, tools/list and tools/call over
-    newline-delimited JSON-RPC 2.0. It deliberately does not grant authority based
-    on server metadata; callers must route resulting proposals through AATG.
+    The current MCP core is stateless, so each request carries protocol and
+    client metadata. This lab implements only `server/discover`, `tools/list`,
+    and `tools/call`. Tool metadata and output never grant AATG authority.
     """
 
-    def __init__(self, argv: Sequence[str], *, expected_server_name: str | None = None):
-        if not argv:
-            raise ValueError("mcp_command_empty")
-        self.argv = list(argv)
-        self.expected_server_name = expected_server_name
-        self.process: subprocess.Popen[str] | None = None
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        server_pin: MCPServerPin,
+        client_name: str = "aatg-live-lab",
+        client_version: str = "0.4.0",
+        timeout: float = 3.0,
+    ):
+        self.endpoint = endpoint
+        self.server_pin = server_pin
+        self.client_name = client_name
+        self.client_version = client_version
+        self.timeout = timeout
         self._request_id = 0
-        self.server_name: str | None = None
+        self.server_name = server_pin.server_id
 
-    def __enter__(self) -> "StdioMCPClient":
-        self.process = subprocess.Popen(
-            self.argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        self._initialize()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if self.process is not None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=2)
-
-    def _write(self, message: dict[str, Any]) -> None:
-        if self.process is None or self.process.stdin is None:
-            raise MCPProtocolError("mcp_not_started")
-        encoded = json.dumps(message, separators=(",", ":"))
-        if "\n" in encoded:
-            raise MCPProtocolError("mcp_embedded_newline")
-        self.process.stdin.write(encoded + "\n")
-        self.process.stdin.flush()
-
-    def _read(self) -> dict[str, Any]:
-        if self.process is None or self.process.stdout is None:
-            raise MCPProtocolError("mcp_not_started")
-        line = self.process.stdout.readline()
-        if not line:
-            stderr = ""
-            if self.process.stderr is not None:
-                stderr = self.process.stderr.read()
-            raise MCPProtocolError(f"mcp_server_closed:{stderr.strip()}")
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise MCPProtocolError("invalid_mcp_json") from exc
-        if message.get("jsonrpc") != "2.0":
-            raise MCPProtocolError("invalid_jsonrpc_version")
-        return message
-
-    def _request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        self._request_id += 1
-        request: dict[str, Any] = {"jsonrpc": "2.0", "id": self._request_id, "method": method}
-        if params is not None:
-            request["params"] = params
-        self._write(request)
-        response = self._read()
-        if response.get("id") != self._request_id:
-            raise MCPProtocolError("mcp_response_id_mismatch")
-        if "error" in response:
-            raise MCPProtocolError(f"mcp_error:{response['error']}")
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise MCPProtocolError("mcp_result_missing")
+    def discover(self) -> dict[str, Any]:
+        result, headers = self._request("server/discover", {})
+        self._verify_server(headers)
         return result
-
-    def _initialize(self) -> None:
-        result = self._request(
-            "initialize",
-            {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "aatg-live-lab", "version": "0.4.0"},
-            },
-        )
-        negotiated = result.get("protocolVersion")
-        if negotiated != MCP_PROTOCOL_VERSION:
-            raise MCPProtocolError(f"unsupported_mcp_version:{negotiated}")
-        server_info = result.get("serverInfo") or {}
-        self.server_name = str(server_info.get("name", "unknown"))
-        if self.expected_server_name and self.server_name != self.expected_server_name:
-            raise MCPProtocolError("mcp_server_identity_mismatch")
-        self._write({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     def list_tools(self, guard: MCPMetadataGuard | None = None) -> list[MCPToolDescriptor]:
         guard = guard or MCPMetadataGuard()
-        result = self._request("tools/list", {})
+        result, headers = self._request("tools/list", {})
+        self._verify_server(headers)
         tools = result.get("tools")
         if not isinstance(tools, list):
             raise MCPProtocolError("mcp_tools_missing")
-        return [guard.inspect(tool) for tool in tools if isinstance(tool, dict)]
+        descriptors: list[MCPToolDescriptor] = []
+        for raw in tools:
+            if not isinstance(raw, dict):
+                raise MCPTrustError("invalid_tool_metadata")
+            self._verify_tool_pin(raw)
+            descriptors.append(guard.inspect(raw))
+        return descriptors
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> LiveMCPResult:
-        result = self._request("tools/call", {"name": name, "arguments": arguments})
+        if name not in self.server_pin.tools:
+            raise MCPTrustError("tool_not_pinned")
+        result, headers = self._request(
+            "tools/call",
+            {"name": name, "arguments": arguments},
+            name=name,
+        )
+        self._verify_server(headers)
         if result.get("isError") is True:
             raise MCPProtocolError("mcp_tool_reported_error")
         structured = result.get("structuredContent")
@@ -185,14 +150,75 @@ class StdioMCPClient:
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
                     text_parts.append(str(block.get("text", "")))
-        taints = ["external_tool_output", "unverified_tool_output"]
+        taints = ["external_tool_output", "unverified_tool_output", "untrusted_mcp_content"]
         joined = "\n".join(text_parts).lower()
         if any(fragment in joined for fragment in MCPMetadataGuard.suspicious_fragments):
             taints.append("prompt_injection_suspected")
         return LiveMCPResult(
-            server_name=self.server_name or "unknown",
+            server_name=self.server_name,
             tool_name=name,
             data=data,
             text=tuple(text_parts),
             taints=tuple(taints),
         )
+
+    def _request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        name: str | None = None,
+    ) -> tuple[dict[str, Any], Any]:
+        self._request_id += 1
+        request_id = self._request_id
+        request_params = dict(params)
+        request_params["_meta"] = {
+            CLIENT_INFO_KEY: {"name": self.client_name, "version": self.client_version}
+        }
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": request_params,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+            "Mcp-Method": method,
+        }
+        if name is not None:
+            headers["Mcp-Name"] = name
+        req = request.Request(
+            self.endpoint,
+            data=json.dumps(payload, separators=(",", ":")).encode(),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout) as response:
+                response_payload = json.loads(response.read())
+                response_headers = response.headers
+        except (error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise MCPProtocolError("mcp_transport_failure") from exc
+        if response_payload.get("jsonrpc") != "2.0":
+            raise MCPProtocolError("invalid_jsonrpc_version")
+        if response_payload.get("id") != request_id:
+            raise MCPProtocolError("mcp_response_id_mismatch")
+        if "error" in response_payload:
+            raise MCPProtocolError(f"mcp_error:{response_payload['error']}")
+        result = response_payload.get("result")
+        if not isinstance(result, dict):
+            raise MCPProtocolError("mcp_result_missing")
+        return result, response_headers
+
+    def _verify_server(self, headers: Any) -> None:
+        if headers.get("X-AATG-Lab-Server-ID") != self.server_pin.server_id:
+            raise MCPTrustError("mcp_server_identity_mismatch")
+
+    def _verify_tool_pin(self, tool: dict[str, Any]) -> None:
+        name = str(tool.get("name", ""))
+        pin = self.server_pin.tools.get(name)
+        if pin is None:
+            raise MCPTrustError(f"untrusted_tool:{name}")
+        if canonical_digest(tool.get("inputSchema") or {}) != pin.input_schema_digest:
+            raise MCPTrustError(f"tool_schema_mismatch:{name}")
