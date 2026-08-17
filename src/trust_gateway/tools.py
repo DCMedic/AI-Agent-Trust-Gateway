@@ -24,6 +24,14 @@ class ToolRegistry:
             raise KeyError(f"unknown_tool_action:{tool}.{action}")
         return handler(arguments)
 
+    def taints(self, tool: str, action: str, output: dict[str, Any]) -> list[str]:
+        taints = ["unverified_tool_output"]
+        if (tool, action) == ("notes", "read"):
+            taints.append("stored_user_content")
+        if output.get("simulated"):
+            taints.append("simulated_effect")
+        return taints
+
     def verify(self, tool: str, action: str, arguments: dict[str, Any], output: dict[str, Any]) -> bool:
         if (tool, action) == ("notes", "read"):
             return output.get("count") == len(self.notes)
