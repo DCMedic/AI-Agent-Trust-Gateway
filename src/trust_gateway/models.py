@@ -57,6 +57,12 @@ class Approval(BaseModel):
     expires_at: datetime
 
 
+class ApprovalSet(BaseModel):
+    """A proposal-bound set of independent human approvals for dual control."""
+
+    approvals: list[Approval] = Field(min_length=2)
+
+
 class ExecutionResult(BaseModel):
     proposal_id: str
     status: str
