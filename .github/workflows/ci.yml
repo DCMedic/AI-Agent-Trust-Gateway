@@ -26,3 +26,5 @@ jobs:
         run: python tools/run_scenarios.py
       - name: Run scored red-team evaluation
         run: python tools/evaluate_redteam.py
+      - name: Run live MCP adversarial lab
+        run: python lab/run_live_lab.py
