@@ -62,3 +62,5 @@ class ExecutionResult(BaseModel):
     status: str
     output: dict[str, Any] = Field(default_factory=dict)
     verified: bool = False
+    output_taints: list[str] = Field(default_factory=list)
+    capability_id: str | None = None
