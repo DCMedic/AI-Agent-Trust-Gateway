@@ -4,46 +4,50 @@
 
 AI Agent Trust Gateway (AATG) is a security reference architecture and runnable Python service for placing a policy-enforcement boundary between an AI agent and the tools it wants to use.
 
-The gateway does **not** assume that a model is malicious. It assumes something more operationally useful: a model can be wrong, manipulated, overconfident, compromised by untrusted context, or granted more authority than a particular task requires.
+The gateway does **not** assume that a model is malicious. It assumes something more operationally useful: a model can be wrong, manipulated, overconfident, compromised by untrusted context, impersonated, or granted more authority than a particular task requires.
 
 ## v0.2 trust model
 
-AATG v0.2 separates several forms of authority that are often collapsed into one in agent systems:
+AATG v0.2 separates forms of trust and authority that are often collapsed into one in agent systems:
 
-1. **Static policy** answers whether an agent class is ever permitted to propose an action.
-2. **Capability authority** delegates short-lived, cryptographically signed permission for a specific agent/tool/action/argument envelope.
-3. **Risk budget** limits cumulative authority exercised by an agent inside a sliding time window.
-4. **Human approval** authorizes one exact high-impact proposal and is consumed after one use.
+1. **Workload identity** establishes which agent/workload is actually presenting the proposal.
+2. **Static policy** answers whether that agent class is ever permitted to propose the action.
+3. **Capability authority** delegates short-lived, cryptographically signed permission for a specific agent/tool/action/argument envelope.
+4. **Risk budget** limits cumulative authority exercised by an agent inside a sliding time window.
+5. **Human approval** authorizes one exact high-impact proposal and is consumed after one use.
+6. **Independent verification** evaluates the result separately from the command path and preserves output provenance.
 
-Passing one layer does not bypass the others. A high-risk action can therefore require policy permission, a valid capability, available risk budget, and a fresh human approval before execution.
+Passing one layer does not bypass the others. A high-risk action can therefore require a valid workload identity, policy permission, a valid delegated capability, available risk budget, and a fresh human approval before execution.
 
 ## Security invariants
 
 1. **No direct tool execution.** Agents submit action proposals; only the gateway invokes tools.
-2. **Default deny.** Unknown agents, tools, actions, and argument patterns are rejected.
-3. **Least authority.** Authorization is evaluated per agent, tool, action, argument envelope, and risk tier.
-4. **Delegation is explicit.** Medium/high-risk authority can be represented by short-lived HMAC-signed capabilities.
-5. **Capabilities are scoped.** Tokens are bound to subject, audience, tool, action, expiration, and optional argument constraints.
-6. **Cumulative impact is bounded.** Sliding-window risk budgets prevent a sequence of individually permitted actions from silently becoming excessive authority.
-7. **High-impact actions require human approval.** Approval is bound to the exact proposal digest and expires.
-8. **Approvals are single use.** Replaying an already consumed approval is blocked and audited.
-9. **Argument constraints are enforced twice.** Static policy and delegated capability constraints can independently restrict parameters.
-10. **Policy is evaluated before execution.** Tool adapters cannot bypass the decision point.
-11. **Every decision is auditable.** Proposal, policy, capability, budget, approval, execution, denial, replay, and verification events are written to a hash-chained journal.
+2. **Identity and authorization are separate.** Proving which workload is calling does not imply that workload is permitted to perform the requested action.
+3. **Default deny.** Unknown agents, tools, actions, and argument patterns are rejected.
+4. **Least authority.** Authorization is evaluated per agent, tool, action, argument envelope, and risk tier.
+5. **Delegation is explicit.** Medium/high-risk authority can be represented by short-lived HMAC-signed capabilities.
+6. **Capabilities are scoped.** Tokens are bound to subject, audience, tool, action, expiration, and optional argument constraints.
+7. **Cumulative impact is bounded.** Sliding-window risk budgets prevent a sequence of individually permitted actions from silently becoming excessive authority.
+8. **High-impact actions require human approval.** Approval is bound to the exact proposal digest and expires.
+9. **Approvals are single use.** Replaying an already consumed approval is blocked and audited.
+10. **Argument constraints are enforced twice.** Static policy and delegated capability constraints can independently restrict parameters.
+11. **Every decision is auditable.** Identity, proposal, policy, capability, budget, approval, execution, denial, replay, and verification events are written to a hash-chained journal.
 12. **Tool output is not automatically trusted.** Results carry provenance/taint labels until independent verification resolves what it actually can prove.
 13. **Verification does not erase provenance.** A verified result can still remain tainted as stored user content, simulated state, or external tool output.
-14. **Failures fail closed.** Policy, capability, budget, approval, adapter, or verification errors do not silently become success.
+14. **Failures fail closed.** Identity, policy, capability, budget, approval, adapter, or verification errors do not silently become success.
 
 ## Architecture
 
 ```text
- AI agent / model
+ AI agent / workload
         |
+        | signed identity assertion
         | ActionProposal
         v
 +----------------------------+
 | AI Agent Trust Gateway     |
 |                            |
+| workload identity          |
 | static policy              |
 | capability verification    |
 | argument constraints       |
@@ -68,11 +72,17 @@ Passing one layer does not bypass the others. A high-risk action can therefore r
 +----------------------------+
 ```
 
+## Workload identity
+
+`WorkloadIdentity` provides dependency-light signed identity assertions for the reference implementation. Assertions contain a subject, audience, key ID, unique assertion ID, issuance time, and expiration time. The gateway can require the assertion subject to match the `agent_id` in the action proposal before policy evaluation proceeds.
+
+The reference implementation uses HMAC-SHA256 so the identity boundary is inspectable without additional infrastructure. It is **not** presented as the preferred production identity architecture. A hardened deployment should use an external workload identity plane such as SPIFFE/SPIRE, cloud workload identity/OIDC, or mTLS certificates backed by managed PKI.
+
 ## Capability tokens
 
 `CapabilityIssuer` implements a deliberately small reference capability format using HMAC-SHA256. Each token contains a unique identifier, subject, audience, tool, action, issuance/expiration time, and optional argument constraints.
 
-Capabilities are **delegated authority**, not authentication by themselves. Production deployments should bind issuance to a mature workload identity system, KMS/HSM-protected signing keys, rotation, revocation, and durable replay controls.
+Capabilities are **delegated authority**, not authentication by themselves. A valid identity assertion establishes who is calling; a capability establishes a bounded authority that has been delegated to that identity.
 
 ## Risk budgets
 
@@ -89,7 +99,7 @@ The current budget state is intentionally in-memory for research clarity. A prod
 
 High-risk approval is intentionally narrower than "approve this agent." An `Approval` is bound to the SHA-256 digest of one exact proposal, including its tool, action, arguments, purpose, identity, and creation time.
 
-v0.2 adds a single-use approval ledger. Once accepted for execution, the approval ID is consumed. Reusing it is treated as a replay attempt and produces an audit event.
+Once accepted for execution, the approval ID is consumed. Reusing it is treated as a replay attempt and produces an audit event.
 
 ## Output taint tracking
 
@@ -129,13 +139,15 @@ python tools/evaluate_redteam.py
 uvicorn trust_gateway.app:app --reload
 ```
 
-To enable capability enforcement in the API process, set a secret of at least 32 bytes:
+Optional API trust controls are enabled with environment secrets of at least 32 bytes:
 
 ```bash
-export AATG_CAPABILITY_SECRET='replace-with-a-development-secret-of-at-least-32-bytes'
+export AATG_IDENTITY_SECRET='replace-with-a-development-identity-secret-at-least-32-bytes'
+export AATG_IDENTITY_KEY_ID='dev-key'
+export AATG_CAPABILITY_SECRET='replace-with-a-development-capability-secret-at-least-32-bytes'
 ```
 
-Do not use an application environment variable as the long-term signing-key strategy for a production deployment.
+Do not use application environment variables as the long-term key-management strategy for a production deployment.
 
 ## Adversarial evaluation
 
@@ -153,6 +165,8 @@ CI fails if either adversarial containment or benign completion drops below `1.0
 
 Current regression coverage includes:
 
+- missing or mismatched workload identity
+- tampered or expired identity assertion
 - unknown agent requesting a tool
 - known agent attempting an unauthorized action
 - argument-constraint violation
@@ -170,7 +184,7 @@ Current regression coverage includes:
 - MCP output without an independent verifier
 - audit-chain integrity validation
 
-The objective is not merely to demonstrate successful agent behavior. The project is designed to make unsafe, ambiguous, over-privileged, cumulative, and replayed behavior observable and containable.
+The objective is not merely to demonstrate successful agent behavior. The project is designed to make unsafe, ambiguous, impersonated, over-privileged, cumulative, and replayed behavior observable and containable.
 
 ## Documentation
 
@@ -184,7 +198,7 @@ This project explores a central question in trustworthy agentic systems:
 
 > **How much authority should an AI system possess directly, and what evidence should be required before its requested actions are allowed to produce external effects?**
 
-Next research milestones include durable capability revocation, cryptographic workload identity, dual-control approval, live MCP integration, information-flow policy, independent verification providers, policy differential testing, richer sequence attacks, and a larger reproducible red-team corpus.
+Next research milestones include durable capability revocation, asymmetric/KMS-backed identity and capability signing, dual-control approval, live MCP integration, information-flow policy, independent verification providers, policy differential testing, richer sequence attacks, and a larger reproducible red-team corpus.
 
 ## Scope
 
