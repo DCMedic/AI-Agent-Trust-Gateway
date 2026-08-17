@@ -6,7 +6,9 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
+from pathlib import Path
 import secrets
+import sqlite3
 from threading import Lock
 from typing import Any, Protocol
 
@@ -26,17 +28,12 @@ def _unb64(value: str) -> bytes:
 
 class RevocationStore(Protocol):
     def is_revoked(self, capability_id: str) -> bool: ...
-
     def revoke(self, capability_id: str) -> None: ...
 
 
 @dataclass
 class CapabilityRevocationList:
-    """Thread-safe reference revocation store.
-
-    A production deployment should persist revocations in a shared datastore or
-    use short-lived capabilities plus a centrally managed signing/key lifecycle.
-    """
+    """Thread-safe in-memory reference revocation store."""
 
     revoked_ids: set[str] = field(default_factory=set)
     _lock: Lock = field(default_factory=Lock, repr=False)
@@ -48,6 +45,42 @@ class CapabilityRevocationList:
     def revoke(self, capability_id: str) -> None:
         with self._lock:
             self.revoked_ids.add(capability_id)
+
+
+class SQLiteCapabilityRevocationList:
+    """Durable capability revocation state for single-node reference deployments."""
+
+    def __init__(self, path: str | Path):
+        self.path = str(path)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS revoked_capabilities (
+                    capability_id TEXT PRIMARY KEY,
+                    revoked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=5.0)
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+
+    def is_revoked(self, capability_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM revoked_capabilities WHERE capability_id = ?",
+                (capability_id,),
+            ).fetchone()
+        return row is not None
+
+    def revoke(self, capability_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO revoked_capabilities (capability_id) VALUES (?)",
+                (capability_id,),
+            )
 
 
 @dataclass(frozen=True)
