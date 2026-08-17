@@ -17,12 +17,11 @@ class FlowDecision:
 
 
 class InformationFlowPolicy:
-    """Conservative policy for moving untrusted evidence into agent actions.
+    """Conservative information-flow policy for agent evidence.
 
-    The reference rule intentionally separates *retrieving information* from
-    *granting that information authority*. External MCP content may be displayed
-    or analyzed, but suspicious/unverified content cannot directly parameterize
-    medium- or high-risk effects without an explicit declassification step.
+    Low-risk observation is allowed. Medium/high-risk effects fail closed when
+    evidence remains unverified/untrusted, or when evidence crosses trust domains
+    carrying provenance that has not been explicitly declassified.
     """
 
     blocked_for_effects = frozenset(
@@ -35,16 +34,44 @@ class InformationFlowPolicy:
         }
     )
 
-    def evaluate(self, taints: Iterable[str], target_risk: RiskTier) -> FlowDecision:
+    def evaluate(
+        self,
+        taints: Iterable[str],
+        target_risk: RiskTier,
+        *,
+        source_domains: Iterable[str] = (),
+        target_domain: str = "local",
+    ) -> FlowDecision:
         taint_set = set(taints)
+        domains = {domain for domain in source_domains if domain}
         if target_risk == RiskTier.LOW:
             return FlowDecision(True, ("low_risk_observation_allowed",))
+
+        reasons: list[str] = []
         blocked = sorted(taint_set & self.blocked_for_effects)
-        if blocked:
-            return FlowDecision(False, tuple(f"blocked_taint:{item}" for item in blocked))
+        reasons.extend(f"blocked_taint:{item}" for item in blocked)
+
+        foreign = sorted(domain for domain in domains if domain != target_domain)
+        if foreign and taint_set:
+            reasons.extend(f"cross_domain_evidence:{domain}->{target_domain}" for domain in foreign)
+
+        if reasons:
+            return FlowDecision(False, tuple(reasons))
         return FlowDecision(True, ("information_flow_authorized",))
 
-    def require(self, taints: Iterable[str], target_risk: RiskTier) -> None:
-        decision = self.evaluate(taints, target_risk)
+    def require(
+        self,
+        taints: Iterable[str],
+        target_risk: RiskTier,
+        *,
+        source_domains: Iterable[str] = (),
+        target_domain: str = "local",
+    ) -> None:
+        decision = self.evaluate(
+            taints,
+            target_risk,
+            source_domains=source_domains,
+            target_domain=target_domain,
+        )
         if not decision.allowed:
             raise InformationFlowError(",".join(decision.reasons))
