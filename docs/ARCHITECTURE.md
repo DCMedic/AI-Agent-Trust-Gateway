@@ -4,9 +4,9 @@
 
 The gateway treats model output as a **proposal**, not an instruction with inherent authority.
 
-The v0.2 execution path deliberately decomposes authority and evidence:
+The v0.2 execution path deliberately decomposes identity, authority, cumulative impact, and evidence:
 
-1. identify the proposing agent
+1. verify the proposing workload identity when identity enforcement is enabled
 2. parse a structured `ActionProposal`
 3. evaluate explicit static policy
 4. validate arguments against policy constraints
@@ -21,9 +21,15 @@ The v0.2 execution path deliberately decomposes authority and evidence:
 
 No step relies on the model's confidence or natural-language justification as an authorization primitive.
 
-## Authority decomposition
+## Trust and authority decomposition
 
-AATG intentionally keeps three forms of authority separate.
+AATG intentionally keeps identity, static permission, delegated authority, cumulative impact, and human authorization separate.
+
+### Workload identity
+
+`WorkloadIdentity` verifies a signed assertion containing subject, audience, key ID, assertion ID, issuance time, and expiration. When configured, the assertion subject must match the proposal's `agent_id` before execution proceeds.
+
+The reference implementation uses HMAC-SHA256 to keep the mechanism inspectable and dependency-light. A production deployment should replace it with an external workload identity system such as SPIFFE/SPIRE, cloud OIDC workload identity, or mTLS certificates backed by managed PKI.
 
 ### Static policy
 
@@ -34,6 +40,10 @@ AATG intentionally keeps three forms of authority separate.
 `CapabilityIssuer` creates short-lived HMAC-SHA256 capability tokens. A token is bound to a subject, audience, tool, action, expiration, unique capability ID, and optional argument constraints.
 
 A capability cannot expand static policy. Both checks must pass.
+
+### Cumulative risk budget
+
+`RiskBudget` assigns cumulative impact costs to risk tiers and maintains a sliding window per agent. The reference costs are low=0, medium=1, high=3. This limits sequences of individually permitted actions that collectively exceed the intended authority envelope.
 
 ### Human approval
 
@@ -54,10 +64,6 @@ A typed request containing agent identity, tool, action, arguments, declared pur
 ### Capability verifier
 
 The capability layer represents explicitly delegated authority. It validates signature, audience, subject, tool/action scope, expiration, and optional argument constraints before a medium/high-risk action can proceed when capability enforcement is enabled.
-
-### Risk budget
-
-`RiskBudget` assigns cumulative impact costs to risk tiers and maintains a sliding window per agent. The reference costs are low=0, medium=1, high=3. This limits sequences of individually permitted actions that collectively exceed the intended authority envelope.
 
 ### Approval control
 
@@ -86,16 +92,19 @@ Security-relevant transitions are written as JSONL records linked by SHA-256 has
 ## Security state machine
 
 ```text
-PROPOSED
+REQUEST
    |
    v
-POLICY_EVALUATED ----deny----> DENIED
+IDENTITY_CHECK ----missing/invalid----> DENIED
    |
    v
-CAPABILITY_CHECK ----invalid/missing----> DENIED / CAPABILITY_REQUIRED
+POLICY_EVALUATED ----deny-------------> DENIED
    |
    v
-RISK_BUDGET_CHECK ----exceeded----> DENIED
+CAPABILITY_CHECK ----invalid/missing--> DENIED / CAPABILITY_REQUIRED
+   |
+   v
+RISK_BUDGET_CHECK ----exceeded--------> DENIED
    |
    +----allow---------------------------> EXECUTING
    |
@@ -121,6 +130,10 @@ RISK_BUDGET_CHECK ----exceeded----> DENIED
                          COMPLETED      VERIFICATION_FAILED
 ```
 
+## Why identity is not authorization
+
+A cryptographically valid assertion proves only that the caller controls the credential for the stated workload identity. It does not grant permission to use a tool. Static policy, delegated capabilities, risk budget, and human approval remain separate gates. This prevents the common mistake of treating authentication as blanket authority.
+
 ## Why approval is digest-bound and single-use
 
 A generic approval such as "allow the agent to restart a service" is vulnerable to ambiguity, bait-and-switch changes, and replay. AATG instead approves a digest of the entire proposal. If the agent changes the service, argument set, stated purpose, ID, or timestamp, the digest changes and the approval no longer matches. After a matching approval is accepted, its ID is consumed so the same human decision cannot silently authorize repeated execution.
@@ -137,8 +150,8 @@ Per-action authorization alone misses sequence risk. An agent could perform many
 
 A hardened implementation should replace demonstration components with:
 
-- workload identity backed by a real PKI/OIDC/SPIFFE-like identity plane
-- asymmetric or KMS/HSM-backed capability signing, rotation, and revocation
+- external workload identity backed by PKI/OIDC/SPIFFE-like infrastructure
+- asymmetric or KMS/HSM-backed identity and capability signing, rotation, and revocation
 - durable approval workflows with strong human identity and optional dual control
 - durable risk-budget state and distributed replay protection
 - external policy decision points or formally versioned policy bundles
