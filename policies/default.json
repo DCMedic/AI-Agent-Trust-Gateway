@@ -1,0 +1,48 @@
+{
+  "agents": {
+    "research-agent": {
+      "tools": {
+        "notes": {
+          "read": {
+            "risk": "low",
+            "requires_approval": false,
+            "constraints": {
+              "allowed_keys": []
+            }
+          },
+          "append": {
+            "risk": "medium",
+            "requires_approval": false,
+            "constraints": {
+              "allowed_keys": ["text"],
+              "required_keys": ["text"],
+              "max_lengths": {"text": 500}
+            }
+          }
+        }
+      }
+    },
+    "operations-agent": {
+      "tools": {
+        "notes": {
+          "read": {
+            "risk": "low",
+            "requires_approval": false,
+            "constraints": {"allowed_keys": []}
+          }
+        },
+        "service": {
+          "restart": {
+            "risk": "high",
+            "requires_approval": true,
+            "constraints": {
+              "allowed_keys": ["service"],
+              "required_keys": ["service"],
+              "allowed_values": {"service": ["demo-api"]}
+            }
+          }
+        }
+      }
+    }
+  }
+}
