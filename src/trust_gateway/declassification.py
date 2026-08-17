@@ -62,17 +62,28 @@ class DeclassificationAuthority:
         if not allowed:
             raise DeclassificationError("no_taints_selected")
         now = datetime.now(timezone.utc)
+        expires_at = now + ttl
+        grant_id = secrets.token_urlsafe(16)
         payload = {
-            "grant_id": secrets.token_urlsafe(16),
+            "grant_id": grant_id,
             "evidence_digest": evidence_digest,
             "removable_taints": allowed,
             "target_domain": target_domain,
             "reviewer": reviewer,
             "issued_at": now.isoformat(),
-            "expires_at": (now + ttl).isoformat(),
+            "expires_at": expires_at.isoformat(),
         }
         signature = hmac.new(self.secret, _canonical(payload), hashlib.sha256).hexdigest()
-        return DeclassificationGrant(signature=signature, **payload)
+        return DeclassificationGrant(
+            grant_id=grant_id,
+            evidence_digest=evidence_digest,
+            removable_taints=allowed,
+            target_domain=target_domain,
+            reviewer=reviewer,
+            issued_at=now,
+            expires_at=expires_at,
+            signature=signature,
+        )
 
     def verify(
         self,
