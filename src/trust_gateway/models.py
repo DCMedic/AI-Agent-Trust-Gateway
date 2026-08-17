@@ -22,6 +22,16 @@ class RiskTier(str, Enum):
     HIGH = "high"
 
 
+class EvidenceClaim(BaseModel):
+    """Provenance carried from an information source into a proposed effect."""
+
+    source: str
+    trust_domain: str
+    payload_digest: str
+    taints: list[str] = Field(default_factory=list)
+    declassification_grant_ids: list[str] = Field(default_factory=list)
+
+
 class ActionProposal(BaseModel):
     proposal_id: str = Field(default_factory=lambda: str(uuid4()))
     agent_id: str
@@ -30,7 +40,18 @@ class ActionProposal(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
     purpose: str
     evidence_taints: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceClaim] = Field(default_factory=list)
+    target_trust_domain: str = "local"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def all_evidence_taints(self) -> list[str]:
+        combined = set(self.evidence_taints)
+        for claim in self.evidence:
+            combined.update(claim.taints)
+        return sorted(combined)
+
+    def source_domains(self) -> list[str]:
+        return sorted({claim.trust_domain for claim in self.evidence})
 
     def digest(self) -> str:
         canonical = {
@@ -41,6 +62,8 @@ class ActionProposal(BaseModel):
             "arguments": self.arguments,
             "purpose": self.purpose,
             "evidence_taints": sorted(self.evidence_taints),
+            "evidence": [claim.model_dump(mode="json") for claim in self.evidence],
+            "target_trust_domain": self.target_trust_domain,
             "created_at": self.created_at.isoformat(),
         }
         return sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
