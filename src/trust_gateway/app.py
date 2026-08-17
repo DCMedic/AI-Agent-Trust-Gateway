@@ -62,8 +62,8 @@ gateway = TrustGateway(
 
 app = FastAPI(
     title="AI Agent Trust Gateway",
-    version="0.3.0",
-    description="Policy-provenanced, durable security boundary for AI agent tool execution.",
+    version="0.4.0",
+    description="Policy-provenanced AI agent security boundary with taint-aware MCP information-flow controls.",
 )
 
 
@@ -77,11 +77,12 @@ def health() -> dict[str, object]:
     provenance = policy.provenance
     return {
         "status": "ok",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "audit_chain_valid": audit.verify(),
         "capability_enforcement": capabilities is not None,
         "workload_identity_enforcement": identities is not None,
         "durable_authority_state": True,
+        "taint_aware_information_flow": True,
         "high_risk_approval_quorum": approval_quorum,
         "signed_policy": provenance is not None,
         "policy_id": provenance.policy_id if provenance else None,
