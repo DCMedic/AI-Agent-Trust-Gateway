@@ -2,7 +2,12 @@ from datetime import datetime, timedelta, timezone
 
 from trust_gateway.approvals import SQLiteApprovalLedger
 from trust_gateway.audit import AuditJournal
-from trust_gateway.capabilities import CapabilityError, CapabilityIssuer, CapabilityRevocationList
+from trust_gateway.capabilities import (
+    CapabilityError,
+    CapabilityIssuer,
+    CapabilityRevocationList,
+    SQLiteCapabilityRevocationList,
+)
 from trust_gateway.gateway import TrustGateway
 from trust_gateway.models import ActionProposal, Approval, ApprovalSet
 from trust_gateway.policy import PolicyEngine
@@ -34,6 +39,22 @@ def test_capability_can_be_revoked_before_expiration():
         assert str(exc) == "capability_revoked"
     else:
         raise AssertionError("revoked capability was accepted")
+
+
+def test_capability_revocation_survives_restart(tmp_path):
+    database = tmp_path / "revocations.db"
+    first = CapabilityIssuer(SECRET, revocations=SQLiteCapabilityRevocationList(database))
+    token = first.issue(subject="research-agent", tool="notes", action="append")
+    capability_id = first.revoke(token)
+
+    restarted = CapabilityIssuer(SECRET, revocations=SQLiteCapabilityRevocationList(database))
+    assert restarted.revocations.is_revoked(capability_id) is True
+    try:
+        restarted.verify(token)
+    except CapabilityError as exc:
+        assert str(exc) == "capability_revoked"
+    else:
+        raise AssertionError("durably revoked capability was accepted after restart")
 
 
 def test_revocation_does_not_allow_tampered_token_to_name_arbitrary_id():
