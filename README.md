@@ -1,191 +1,153 @@
 # AI Agent Trust Gateway
 
-**Treat agent actions as untrusted proposals. Establish identity, verify policy provenance, constrain delegated authority, require independent approval, bound cumulative risk, and preserve evidence before external effects are allowed.**
+**Treat agent actions as untrusted proposals. Establish identity, verify policy provenance, constrain delegated authority, preserve information provenance, and require independent evidence before external effects are allowed.**
 
 AI Agent Trust Gateway (AATG) is a runnable security reference architecture for placing an independent trust boundary between an AI agent and the tools, APIs, infrastructure, or cyber-physical systems it can affect.
 
-The project does not assume that an AI model is malicious. It assumes something operationally stronger: a useful model can still be wrong, manipulated by untrusted context, impersonated, overprivileged, replayed, or confidently mistaken about whether an external action succeeded.
+The project does not assume that a model is malicious. It assumes something operationally stronger: a useful model can still be wrong, manipulated by untrusted context, impersonated, overprivileged, replayed, or confidently mistaken about whether an external action succeeded.
 
-## v0.3 — Durable Authority & Policy Provenance
+## v0.4 — Live MCP Adversarial Lab
 
-v0.3 extends the original policy gateway into a layered authority system with durable state and cryptographically attributable policy decisions.
+v0.4 adds a real Model Context Protocol transport boundary and an adversarial lab built against the stateless MCP `2026-07-28` protocol.
 
-The execution chain is:
+The lab does not give an MCP server implicit trust simply because the server is reachable or because its tool metadata is syntactically valid. Server identity, tool schemas, output provenance, information flow, and downstream authority remain separate controls.
 
 ```text
+AI workload
+    |
+    v
 workload identity
-      |
-      v
+    |
+    v
 signed/versioned policy
-      |
-      v
+    |
+    v
 delegated capability
-      |
-      v
-cumulative risk budget
-      |
-      v
-single- or dual-control human approval
-      |
-      v
+    |
+    v
+risk budget + human approval
+    |
+    v
 durable execution reservation
-      |
-      v
-constrained tool adapter
-      |
-      v
-tainted output + independent verification
-      |
-      v
-hash-chained audit evidence
+    |
+    v
+MCP / constrained tool boundary
+    |
+    +---- tool metadata --------> untrusted discovery evidence
+    |
+    +---- tool output ----------> tainted external evidence
+                                      |
+                                      v
+                              information-flow policy
+                                /                \
+                         low-risk analysis    medium/high effect
+                              allowed               blocked
+                                      |
+                                      v
+                         independent verification
+                                      |
+                                      v
+                           hash-chained audit trail
 ```
 
 Passing one layer never grants permission to bypass another.
 
-## Core security invariants
+## What v0.4 tests
 
-1. **Agents do not directly execute tools.** They submit structured `ActionProposal` objects.
-2. **Identity is not authorization.** A valid workload identity proves who is calling, not what that workload may do.
-3. **Policy can be cryptographically attributable.** Signed policy bundles carry an ID, version, signing key ID, canonical digest, and signature.
-4. **Policy tampering fails closed.** A modified signed policy bundle is rejected before the gateway begins serving decisions.
-5. **Delegation is scoped.** Capabilities are bound to subject, audience, tool, action, expiration, unique ID, and optional argument constraints.
-6. **Capabilities can be revoked.** v0.3 includes durable SQLite-backed revocation state for the single-node reference deployment.
-7. **Cumulative authority is bounded.** A sliding-window risk budget limits sequences of individually permitted medium/high-risk actions.
-8. **High-impact approval is proposal-bound.** Human approval applies to one exact proposal digest.
-9. **Dual control is supported.** Critical deployments may require multiple independent approvers; duplicate approver identities do not satisfy quorum.
-10. **Approval replay protection is durable.** Consumed approval IDs survive process restart.
-11. **External effects are reservation-bound.** A proposal is durably reserved before authority is consumed and the tool is invoked.
-12. **Crash ambiguity fails safe.** A proposal left reserved after interruption becomes `execution_in_doubt`; it is not silently executed again.
-13. **Tool success is not truth.** Outputs carry provenance/taint labels and are independently verified where possible.
-14. **Every transition is auditable.** Identity, policy provenance, capabilities, budgets, approvals, reservations, execution, verification, denial, and replay events enter a hash-chained journal.
+The live lab starts an actual local HTTP MCP server process and drives it through JSON-RPC requests. The adversarial server can change behavior between test cases so the gateway can evaluate:
 
-## Signed policy bundles
+- malicious tool descriptions containing instruction injection
+- prompt-injected tool output
+- MCP server impersonation
+- runtime tool-schema replacement
+- confused-deputy privilege escalation
+- cross-tool credential/exfiltration instructions
+- tainted external evidence attempting to parameterize high-impact actions
+- benign MCP calls that should remain usable for low-risk analysis
 
-`PolicyBundleVerifier` defines `aatg.policy-bundle.v1`. The signed payload includes:
+The objective is not to prove that prompt injection is solved. It is to test whether untrusted MCP content is prevented from silently acquiring authority over downstream effects.
 
-- `policy_id`
-- semantic `version`
-- `issued_at`
-- `key_id`
-- canonical SHA-256 `digest`
-- cryptographic signature
-- the policy document itself
+## Current MCP transport model
 
-When a verified bundle is loaded, every `PolicyDecision` includes:
+`StatelessHTTPMCPClient` implements the subset of MCP `2026-07-28` needed by the lab:
 
-- `policy_id`
-- `policy_version`
-- `policy_digest`
-- `policy_key_id`
+- `server/discover`
+- `tools/list`
+- `tools/call`
 
-Because the gateway already writes complete decisions to the audit journal, an investigator can establish exactly which authenticated policy revision authorized or denied a proposal.
+Each request carries the MCP protocol version, request-routing headers, JSON-RPC correlation ID, and client metadata. The lab server is a separate process and communicates over HTTP rather than an in-process mock.
 
-The reference implementation uses HMAC-SHA256 to remain dependency-light and inspectable. Production systems should prefer asymmetric signatures or KMS/HSM-backed signing so policy verifiers do not possess signing authority.
+The reference lab pins:
 
-### Create a signed policy bundle
+- expected server identity
+- expected tool names
+- canonical SHA-256 digests of tool input schemas
 
-```bash
-export AATG_POLICY_SECRET='development-policy-secret-at-least-32-bytes'
-python tools/sign_policy.py policies/default.json policies/default.signed.json \
-  --policy-id aatg-default \
-  --version 3.0.0 \
-  --key-id dev-policy-key
-```
+Tool **descriptions are never authorization inputs**. A malicious description can be surfaced and classified as suspicious without changing what the agent is permitted to do.
 
-Then require that bundle at startup:
+The lab identity header is intentionally a research mechanism, not production authentication. Remote production MCP deployments should use appropriate TLS, authorization, workload identity, and server-authentication controls.
 
-```bash
-export AATG_POLICY_PATH='policies/default.signed.json'
-export AATG_POLICY_KEY_ID='dev-policy-key'
-export AATG_POLICY_SECRET='development-policy-secret-at-least-32-bytes'
-export AATG_REQUIRE_SIGNED_POLICY='true'
-```
+## Information-flow control
 
-## Durable authority state
+AATG now explicitly separates information access from authority.
 
-The reference API now uses SQLite-backed state for three security decisions:
+MCP output receives conservative provenance labels such as:
 
-- consumed human approvals
-- revoked delegated capabilities
-- execution reservations and terminal execution state
-
-These mechanisms survive ordinary process restart and use database uniqueness constraints for atomic replay protection.
-
-This is intentionally a **single-node reference architecture**. A distributed production deployment would need a strongly consistent shared datastore, transactional semantics across replicas, explicit recovery procedures, and carefully designed failure domains.
-
-## Crash-safe execution semantics
-
-External side effects create a difficult ambiguity: a process can fail after authorization has been consumed but before the caller learns whether the side effect occurred.
-
-v0.3 therefore introduces `SQLiteExecutionLedger`.
-
-Immediately before approval consumption, risk consumption, and tool execution, the gateway atomically reserves the proposal ID and digest. A later attempt to execute that same proposal is rejected.
-
-If the reservation is still nonterminal after a restart, the gateway reports:
-
-```text
-execution_in_doubt
-```
-
-It does **not** automatically retry. The correct recovery path is to inspect independent external state, determine whether the effect occurred, and deliberately issue a new proposal when another attempt is appropriate.
-
-This trades some availability for protection against duplicate high-impact effects.
-
-## Dual-control approval
-
-`high_risk_approval_quorum` controls how many independent human approvals a high-risk proposal requires. The default remains `1` for compatibility. Set:
-
-```bash
-export AATG_HIGH_RISK_APPROVAL_QUORUM=2
-```
-
-The `/v1/proposals/execute-controlled` endpoint accepts multiple proposal-bound approvals. Two approvals carrying the same approver identity are rejected as non-independent.
-
-## Workload identity
-
-`WorkloadIdentity` provides signed, short-lived reference workload assertions containing subject, audience, key ID, unique assertion ID, issuance time, and expiration.
-
-The gateway can require the assertion subject to match the `agent_id` before policy evaluation begins.
-
-The HMAC mechanism is intentionally a reference implementation. Production deployments should use a workload identity plane such as SPIFFE/SPIRE, cloud workload identity/OIDC, or mTLS certificates backed by managed PKI.
-
-## Capability authority and revocation
-
-`CapabilityIssuer` creates short-lived delegated authority scoped to an agent, tool, action, and optional argument envelope. A capability cannot expand static policy.
-
-v0.3 adds revocation. The API can persist revoked capability IDs in the authority database and reject them even before their natural expiration.
-
-## Risk budgets
-
-`RiskBudget` addresses sequence risk. The reference cost model is:
-
-```text
-low    = 0
-medium = 1
-high   = 3
-```
-
-A proposal may be individually authorized and still be rejected because the same agent has exercised too much authority in the current sliding window.
-
-The current risk-budget implementation remains in-memory. Durable/distributed budget accounting is a future research milestone.
-
-## Tool output and taint tracking
-
-Execution success is intentionally separated from information trust.
-
-Tool output begins as `unverified_tool_output`. Independent verification may remove that specific label, but it does not erase unrelated provenance such as:
-
-- `stored_user_content`
-- `simulated_effect`
 - `external_tool_output`
+- `unverified_tool_output`
+- `untrusted_mcp_content`
+- `prompt_injection_suspected`
 
-A successful database read proves that data was retrieved. It does not prove that the retrieved content is truthful, safe, or appropriate to use as authority for another high-impact action.
+`InformationFlowPolicy` permits tainted content to remain available for low-risk inspection and analysis, but prevents those labels from directly flowing into medium- or high-risk effects.
 
-## MCP-style tool boundary
+For example, an MCP search result can be shown to an analyst. The same result cannot directly become the justification or parameter source for a service restart simply because the tool text says to perform one.
 
-`MCPToolAdapter` models an MCP-like external tool server while keeping authorization outside the adapter. External results are marked as untrusted evidence and verification fails closed when no independent verifier exists.
+`ActionProposal.evidence_taints` is included in the proposal digest, so human approval cannot be obtained for one provenance state and then reused after that evidence context is changed.
 
-The adapter remains transport-agnostic in v0.3. Live MCP protocol integration and adversarial tool-server testing are planned for the next research milestone.
+## Security invariants
+
+1. **Agents do not directly execute tools.** They submit structured action proposals.
+2. **Identity is not authorization.** Authentication never implies tool permission.
+3. **Policy is attributable.** Signed policy bundles identify the policy ID, version, key, and canonical digest used for a decision.
+4. **Delegation is scoped and revocable.** Capabilities cannot expand static policy.
+5. **Cumulative authority is bounded.** Risk budgets constrain sequences of individually legitimate actions.
+6. **High-impact approval is proposal-bound.** Approval is tied to the complete proposal digest.
+7. **Dual control is supported.** Critical configurations can require independent human approvers.
+8. **Approval replay protection is durable.** Consumed approval IDs survive restart.
+9. **External effects are reservation-bound.** Interrupted effects become `execution_in_doubt` rather than silently retrying.
+10. **MCP metadata is not authority.** Tool descriptions cannot grant capabilities or alter policy.
+11. **Tool schemas are pinned in the lab.** Runtime schema drift is detected before use.
+12. **External tool output remains tainted.** Successful transport does not establish truth or safety.
+13. **Tainted evidence cannot directly drive higher-risk effects.** Information flow is evaluated independently of tool execution.
+14. **Every security transition is auditable.** Identity, policy, capabilities, approvals, reservations, MCP provenance, denials, execution, and verification remain inspectable.
+
+## Durable authority and policy provenance
+
+v0.3 controls remain part of v0.4:
+
+- HMAC-signed reference workload identity
+- signed/versioned policy bundles
+- scoped HMAC capability tokens
+- SQLite-backed capability revocation
+- cumulative risk budgets
+- proposal-bound human approval
+- configurable dual-control quorum
+- SQLite-backed approval replay protection
+- SQLite execution reservations
+- `execution_in_doubt` recovery semantics
+- hash-chained audit records
+
+These are intentionally inspectable reference mechanisms. Production deployments should replace symmetric application secrets and local SQLite state with appropriate PKI/OIDC/SPIFFE identity, KMS/HSM-backed keys, strongly consistent shared state, remote immutable audit storage, and deployment isolation.
+
+## Live lab files
+
+```text
+src/trust_gateway/mcp_live.py          stateless MCP client + server/tool pinning
+src/trust_gateway/information_flow.py information-flow policy for tainted evidence
+tools/lab_mcp_server.py               adversarial MCP HTTP server
+tests/test_live_mcp_lab.py            transport/security regression suite
+lab/run_live_lab.py                    scored end-to-end live-lab evaluation
+```
 
 ## Quick start
 
@@ -196,10 +158,11 @@ pip install -e ".[dev]"
 pytest
 python tools/run_scenarios.py
 python tools/evaluate_redteam.py
+python lab/run_live_lab.py
 uvicorn trust_gateway.app:app --reload
 ```
 
-Optional trust controls:
+Optional reference trust controls:
 
 ```bash
 export AATG_IDENTITY_SECRET='development-identity-secret-at-least-32-bytes'
@@ -208,34 +171,20 @@ export AATG_CAPABILITY_SECRET='development-capability-secret-at-least-32-bytes'
 export AATG_HIGH_RISK_APPROVAL_QUORUM=2
 ```
 
-The reference API persists authority state at `runtime/authority.db` unless `AATG_AUTHORITY_DB` is set.
-
-Do not use application environment variables or a local SQLite database as the final key-management or distributed-consistency architecture for production deployment.
+Signed policy enforcement can additionally be enabled with `AATG_POLICY_PATH`, `AATG_POLICY_KEY_ID`, `AATG_POLICY_SECRET`, and `AATG_REQUIRE_SIGNED_POLICY=true`.
 
 ## Adversarial evaluation
 
-AATG has both readable scenario tests and a scored red-team harness. Current coverage includes:
+CI executes four complementary layers:
 
-- missing, forged, expired, or mismatched workload identity
-- unknown agent and privilege-expansion attempts
-- parameter smuggling
-- missing, tampered, over-broad, expired, or revoked capabilities
-- cumulative risk-budget exhaustion
-- missing human approval
-- bait-and-switch proposal mutation after approval
-- approval replay
-- durable approval replay after restart
-- dual-control quorum failure and duplicate approvers
-- signed-policy tampering
-- unsigned policy when signatures are mandatory
-- duplicate execution attempts
-- simulated crash leaving execution state in doubt
-- tool failure and misleading success
-- persistent output taint
-- MCP output without an independent verifier
-- audit-chain integrity validation
+1. the complete pytest security regression suite
+2. readable core adversarial scenarios
+3. the scored general red-team corpus
+4. the live MCP adversarial lab
 
-CI continues to fail if the reference red-team corpus falls below its expected containment or benign-completion thresholds.
+The live-lab report uses schema `aatg.mcp-live-lab.v2` and reports its protocol version, individual cases, pass count, total cases, and containment rate. CI fails if a reference live-lab case is not contained as expected.
+
+The lab is intentionally deterministic. It is a reproducible regression boundary, not evidence that arbitrary agent behavior or arbitrary MCP servers are safe.
 
 ## Documentation
 
@@ -247,9 +196,9 @@ CI continues to fail if the reference red-team corpus falls below its expected c
 
 AATG asks a narrow but important question:
 
-> **When an AI system requests an external effect, what independent evidence of identity, authority, intent, policy, and resulting state should exist before that effect is trusted?**
+> **When an AI system requests an external effect, what independent evidence of identity, authority, provenance, policy, intent, and resulting state should exist before that effect is trusted?**
 
-The next milestone is **v0.4 — Live MCP Adversarial Lab**, with emphasis on authenticated live MCP transport, malicious tool descriptions and outputs, prompt-injection propagation, confused-deputy behavior, cross-tool data exfiltration, information-flow restrictions, and richer reproducible adversarial evaluation.
+Potential next milestones include authenticated remote MCP endpoints, OAuth/OIDC authorization evaluation, certificate/server attestation, explicit declassification workflows, durable distributed risk budgets, policy differential testing, multi-server cross-domain information-flow controls, and a larger reproducible adversarial corpus.
 
 ## Scope
 
