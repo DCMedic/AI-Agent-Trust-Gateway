@@ -48,6 +48,10 @@ class PolicyDecision(BaseModel):
     decision: Decision
     risk: RiskTier
     reasons: list[str] = Field(default_factory=list)
+    policy_id: str | None = None
+    policy_version: str | None = None
+    policy_digest: str | None = None
+    policy_key_id: str | None = None
 
 
 class Approval(BaseModel):
