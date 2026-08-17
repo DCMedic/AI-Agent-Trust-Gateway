@@ -2,12 +2,13 @@
 
 ## Objective
 
-AI Agent Trust Gateway reduces the authority implicitly granted to an AI agent by inserting independent policy, delegation, approval, budgeting, and verification boundaries between model output and external side effects.
+AI Agent Trust Gateway reduces the authority implicitly granted to an AI agent by inserting independent identity, policy, delegation, approval, budgeting, and verification boundaries between model output and external side effects.
 
-The gateway assumes the agent can be useful while still being fallible, manipulated, overprivileged, compromised by untrusted context, or inconsistent.
+The gateway assumes the agent can be useful while still being fallible, manipulated, overprivileged, compromised by untrusted context, impersonated, or inconsistent.
 
 ## Protected assets
 
+- workload identity credentials and signing keys
 - delegated capabilities and their signing keys
 - external systems reachable through tools
 - integrity of tool arguments
@@ -22,21 +23,37 @@ The gateway assumes the agent can be useful while still being fallible, manipula
 
 The agent/model is outside the execution trust boundary. Natural-language reasoning, model confidence, chain-of-thought, and self-reported intent are not authorization signals.
 
-Static policy, capability verification, human approval, risk budgeting, audit logging, constrained adapters, and independent verification are separate controls. Passing one control does not imply that another control should trust the request.
+Workload identity, static policy, capability verification, human approval, risk budgeting, audit logging, constrained adapters, and independent verification are separate controls. Passing one control does not imply that another control should trust the request.
 
 ## Primary threats
+
+### Workload impersonation
+
+A caller may claim an authorized `agent_id` without actually controlling the workload credential associated with that identity.
+
+**Controls:** when identity enforcement is configured, the gateway requires a signed workload assertion whose subject matches the proposal `agent_id`, whose audience matches the gateway, and whose signature, key ID, issuance time, and expiration validate.
+
+**Residual risk:** the reference implementation uses symmetric HMAC assertions and an in-process keyring. Production should use external workload identity such as SPIFFE/SPIRE, cloud OIDC workload identity, or managed-PKI mTLS with protected private keys and rotation.
+
+### Identity assertion tampering or replay
+
+An attacker may alter a signed identity assertion or reuse a valid assertion during its lifetime.
+
+**Controls:** HMAC integrity verification, audience binding, subject binding, short expiration, key IDs, assertion IDs, and clock-skew checks.
+
+**Residual risk:** identity assertions are not single-use. Theft within the short validity window remains possible in the reference design.
 
 ### Prompt injection and untrusted context
 
 An agent may consume instructions from documents, web pages, messages, tool output, or other external data and convert them into unsafe tool proposals.
 
-**Controls:** gateway policy does not derive authority from natural-language instructions; tool output is taint-labeled; actions still require tool/action/argument authorization, capability authority where enabled, and human approval where required.
+**Controls:** gateway policy does not derive authority from natural-language instructions; tool output is taint-labeled; actions still require identity, tool/action/argument authorization, capability authority where enabled, and human approval where required.
 
 ### Excessive agency
 
 A useful agent may attempt a tool or action outside the authority needed for its task.
 
-**Controls:** default deny, per-agent static policy, scoped delegated capabilities, cumulative risk budgets, and human approval for high-risk operations.
+**Controls:** default deny, verified identity, per-agent static policy, scoped delegated capabilities, cumulative risk budgets, and human approval for high-risk operations.
 
 ### Parameter smuggling
 
@@ -48,9 +65,9 @@ An agent authorized to call a tool may add unexpected arguments or manipulate pa
 
 A capability token could be copied and presented by a different agent or used for a broader action than intended.
 
-**Controls:** tokens are signed and bound to audience, subject, tool, action, expiration, unique ID, and optional argument constraints. A capability does not override static policy.
+**Controls:** tokens are signed and bound to audience, subject, tool, action, expiration, unique ID, and optional argument constraints. A capability does not override static policy, and its subject can be independently tied to the authenticated workload identity.
 
-**Residual risk:** v0.2 uses bearer-style HMAC capabilities. Theft within the validity window remains possible. Production should bind capabilities to stronger workload identity, use protected asymmetric/KMS-backed keys, support revocation, and minimize TTL.
+**Residual risk:** v0.2 uses bearer-style HMAC capabilities. Theft within the validity window remains possible. Production should use protected asymmetric/KMS-backed keys, support revocation, and minimize TTL.
 
 ### Capability tampering
 
@@ -76,7 +93,7 @@ A valid approval may be reused to repeat a high-impact action without another hu
 
 Previously legitimate authority may remain usable beyond the operational context in which it was granted.
 
-**Controls:** both approvals and capabilities expire.
+**Controls:** identity assertions, approvals, and capabilities expire.
 
 ### Sequence/cumulative-impact abuse
 
@@ -122,7 +139,7 @@ An adapter or application path might execute a tool without passing through auth
 
 ### Safety-control availability failure
 
-A policy, approval, capability, adapter, or verification component may become unavailable.
+An identity, policy, approval, capability, adapter, or verification component may become unavailable.
 
 **Control:** the reference design fails closed rather than treating unavailable safety controls as implicit authorization.
 
@@ -135,10 +152,10 @@ The current evaluation corpus is small and deterministic. It is useful as a regr
 ## Out of scope for v0.2
 
 - defending the underlying model provider or model weights
-- production-grade secrets management and key rotation
+- production-grade secrets management, hardware-backed keys, and key rotation
+- production-grade external workload identity or certificate lifecycle management
 - full MCP transport security or server attestation
 - sandboxing arbitrary generated code
-- cryptographically strong workload identity
 - distributed approval consensus or durable multi-replica replay protection
 - hostile operating-system or cloud administrators
 - formal policy verification
