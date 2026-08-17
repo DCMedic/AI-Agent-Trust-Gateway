@@ -7,6 +7,7 @@ from .audit import AuditJournal
 from .capabilities import CapabilityError, CapabilityIssuer
 from .execution_state import ExecutionStateStore
 from .identity import IdentityError, WorkloadIdentity
+from .infoflow import InformationFlowGuard
 from .models import ActionProposal, Approval, ApprovalSet, Decision, ExecutionResult, PolicyDecision, RiskTier
 from .policy import PolicyEngine
 from .risk import RiskBudget
@@ -25,6 +26,7 @@ class TrustGateway:
         identities: WorkloadIdentity | None = None,
         high_risk_approval_quorum: int = 1,
         executions: ExecutionStateStore | None = None,
+        information_flow: InformationFlowGuard | None = None,
     ):
         if high_risk_approval_quorum < 1:
             raise ValueError("approval_quorum_must_be_positive")
@@ -37,10 +39,25 @@ class TrustGateway:
         self.identities = identities
         self.high_risk_approval_quorum = high_risk_approval_quorum
         self.executions = executions
+        self.information_flow = information_flow or InformationFlowGuard()
 
     def evaluate(self, proposal: ActionProposal) -> PolicyDecision:
         self.audit.append("proposal_received", {"proposal": proposal.model_dump(mode="json")})
         decision = self.policy.evaluate(proposal)
+        if decision.decision != Decision.DENY:
+            flow = self.information_flow.evaluate(proposal, decision.risk)
+            if not flow.allowed:
+                decision = decision.model_copy(
+                    update={"decision": Decision.DENY, "reasons": list(flow.reasons)}
+                )
+                self.audit.append(
+                    "information_flow_denied",
+                    {
+                        "proposal_id": proposal.proposal_id,
+                        "evidence_taints": proposal.evidence_taints,
+                        "reasons": list(flow.reasons),
+                    },
+                )
         self.audit.append(
             "policy_decision",
             {
@@ -130,10 +147,7 @@ class TrustGateway:
         if self.executions is not None:
             if not self.executions.reserve(proposal.proposal_id, proposal.digest()):
                 prior_state = self.executions.state(proposal.proposal_id)
-                self.audit.append(
-                    "execution_replay_blocked",
-                    {"proposal_id": proposal.proposal_id, "prior_state": prior_state},
-                )
+                self.audit.append("execution_replay_blocked", {"proposal_id": proposal.proposal_id, "prior_state": prior_state})
                 return ExecutionResult(
                     proposal_id=proposal.proposal_id,
                     status="execution_in_doubt" if prior_state == "reserved" else "execution_replay_blocked",
