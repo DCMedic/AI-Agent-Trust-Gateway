@@ -7,6 +7,7 @@ from .audit import AuditJournal
 from .capabilities import CapabilityError, CapabilityIssuer
 from .models import ActionProposal, Approval, Decision, ExecutionResult, PolicyDecision, RiskTier
 from .policy import PolicyEngine
+from .risk import RiskBudget
 from .tools import ToolRegistry
 
 
@@ -18,12 +19,14 @@ class TrustGateway:
         tools: ToolRegistry,
         approvals: ApprovalLedger | None = None,
         capabilities: CapabilityIssuer | None = None,
+        risk_budget: RiskBudget | None = None,
     ):
         self.policy = policy
         self.audit = audit
         self.tools = tools
         self.approvals = approvals or ApprovalLedger()
         self.capabilities = capabilities
+        self.risk_budget = risk_budget or RiskBudget(limit=6)
 
     def evaluate(self, proposal: ActionProposal) -> PolicyDecision:
         self.audit.append("proposal_received", {"proposal": proposal.model_dump(mode="json")})
@@ -80,6 +83,22 @@ class TrustGateway:
                 },
             )
 
+        if not self.risk_budget.can_consume(proposal.agent_id, decision.risk):
+            self.audit.append(
+                "risk_budget_exceeded",
+                {
+                    "proposal_id": proposal.proposal_id,
+                    "agent_id": proposal.agent_id,
+                    "risk": decision.risk.value,
+                    "remaining": self.risk_budget.remaining(proposal.agent_id),
+                },
+            )
+            return ExecutionResult(
+                proposal_id=proposal.proposal_id,
+                status="risk_budget_exceeded",
+                capability_id=capability_id,
+            )
+
         if decision.decision == Decision.REQUIRE_APPROVAL:
             if approval is None:
                 self.audit.append("approval_missing", {"proposal_id": proposal.proposal_id})
@@ -101,6 +120,17 @@ class TrustGateway:
                 "approval_accepted",
                 {"proposal_id": proposal.proposal_id, "approval_id": approval.approval_id, "approver": approval.approver},
             )
+
+        self.risk_budget.consume(proposal.agent_id, decision.risk)
+        self.audit.append(
+            "risk_budget_consumed",
+            {
+                "proposal_id": proposal.proposal_id,
+                "agent_id": proposal.agent_id,
+                "risk": decision.risk.value,
+                "remaining": self.risk_budget.remaining(proposal.agent_id),
+            },
+        )
 
         try:
             output = self.tools.execute(proposal.tool, proposal.action, proposal.arguments)
