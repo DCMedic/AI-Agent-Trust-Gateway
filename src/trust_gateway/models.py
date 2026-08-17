@@ -29,6 +29,7 @@ class ActionProposal(BaseModel):
     action: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     purpose: str
+    evidence_taints: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     def digest(self) -> str:
@@ -39,6 +40,7 @@ class ActionProposal(BaseModel):
             "action": self.action,
             "arguments": self.arguments,
             "purpose": self.purpose,
+            "evidence_taints": sorted(self.evidence_taints),
             "created_at": self.created_at.isoformat(),
         }
         return sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
