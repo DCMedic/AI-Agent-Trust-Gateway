@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from .approvals import ApprovalLedger
 from .audit import AuditJournal
 from .capabilities import CapabilityError, CapabilityIssuer
+from .identity import IdentityError, WorkloadIdentity
 from .models import ActionProposal, Approval, Decision, ExecutionResult, PolicyDecision, RiskTier
 from .policy import PolicyEngine
 from .risk import RiskBudget
@@ -20,6 +21,7 @@ class TrustGateway:
         approvals: ApprovalLedger | None = None,
         capabilities: CapabilityIssuer | None = None,
         risk_budget: RiskBudget | None = None,
+        identities: WorkloadIdentity | None = None,
     ):
         self.policy = policy
         self.audit = audit
@@ -27,6 +29,7 @@ class TrustGateway:
         self.approvals = approvals or ApprovalLedger()
         self.capabilities = capabilities
         self.risk_budget = risk_budget or RiskBudget(limit=6)
+        self.identities = identities
 
     def evaluate(self, proposal: ActionProposal) -> PolicyDecision:
         self.audit.append("proposal_received", {"proposal": proposal.model_dump(mode="json")})
@@ -46,18 +49,51 @@ class TrustGateway:
         proposal: ActionProposal,
         approval: Approval | None = None,
         capability_token: str | None = None,
+        identity_token: str | None = None,
     ) -> ExecutionResult:
+        identity_assertion_id: str | None = None
+        if self.identities is not None:
+            if not identity_token:
+                self.audit.append("identity_missing", {"proposal_id": proposal.proposal_id, "agent_id": proposal.agent_id})
+                return ExecutionResult(proposal_id=proposal.proposal_id, status="identity_required")
+            try:
+                identity = self.identities.verify(identity_token, expected_subject=proposal.agent_id)
+            except IdentityError as exc:
+                self.audit.append(
+                    "identity_rejected",
+                    {"proposal_id": proposal.proposal_id, "agent_id": proposal.agent_id, "reason": str(exc)},
+                )
+                return ExecutionResult(proposal_id=proposal.proposal_id, status="identity_rejected")
+            identity_assertion_id = identity.assertion_id
+            self.audit.append(
+                "identity_accepted",
+                {
+                    "proposal_id": proposal.proposal_id,
+                    "agent_id": proposal.agent_id,
+                    "assertion_id": identity.assertion_id,
+                    "key_id": identity.key_id,
+                },
+            )
+
         decision = self.evaluate(proposal)
 
         if decision.decision == Decision.DENY:
             self.audit.append("execution_denied", {"proposal_id": proposal.proposal_id, "reasons": decision.reasons})
-            return ExecutionResult(proposal_id=proposal.proposal_id, status="denied")
+            return ExecutionResult(
+                proposal_id=proposal.proposal_id,
+                status="denied",
+                identity_assertion_id=identity_assertion_id,
+            )
 
         capability_id: str | None = None
         if self.capabilities is not None and decision.risk in {RiskTier.MEDIUM, RiskTier.HIGH}:
             if not capability_token:
                 self.audit.append("capability_missing", {"proposal_id": proposal.proposal_id})
-                return ExecutionResult(proposal_id=proposal.proposal_id, status="capability_required")
+                return ExecutionResult(
+                    proposal_id=proposal.proposal_id,
+                    status="capability_required",
+                    identity_assertion_id=identity_assertion_id,
+                )
             try:
                 claims = self.capabilities.authorize(
                     capability_token,
@@ -71,7 +107,11 @@ class TrustGateway:
                     "capability_rejected",
                     {"proposal_id": proposal.proposal_id, "reason": str(exc)},
                 )
-                return ExecutionResult(proposal_id=proposal.proposal_id, status="capability_rejected")
+                return ExecutionResult(
+                    proposal_id=proposal.proposal_id,
+                    status="capability_rejected",
+                    identity_assertion_id=identity_assertion_id,
+                )
             capability_id = claims.jti
             self.audit.append(
                 "capability_accepted",
@@ -97,25 +137,41 @@ class TrustGateway:
                 proposal_id=proposal.proposal_id,
                 status="risk_budget_exceeded",
                 capability_id=capability_id,
+                identity_assertion_id=identity_assertion_id,
             )
 
         if decision.decision == Decision.REQUIRE_APPROVAL:
             if approval is None:
                 self.audit.append("approval_missing", {"proposal_id": proposal.proposal_id})
-                return ExecutionResult(proposal_id=proposal.proposal_id, status="approval_required", capability_id=capability_id)
+                return ExecutionResult(
+                    proposal_id=proposal.proposal_id,
+                    status="approval_required",
+                    capability_id=capability_id,
+                    identity_assertion_id=identity_assertion_id,
+                )
             approval_error = self._validate_approval(proposal, approval)
             if approval_error:
                 self.audit.append(
                     "approval_rejected",
                     {"proposal_id": proposal.proposal_id, "approval_id": approval.approval_id, "reason": approval_error},
                 )
-                return ExecutionResult(proposal_id=proposal.proposal_id, status="approval_rejected", capability_id=capability_id)
+                return ExecutionResult(
+                    proposal_id=proposal.proposal_id,
+                    status="approval_rejected",
+                    capability_id=capability_id,
+                    identity_assertion_id=identity_assertion_id,
+                )
             if not self.approvals.consume(approval.approval_id):
                 self.audit.append(
                     "approval_replay_blocked",
                     {"proposal_id": proposal.proposal_id, "approval_id": approval.approval_id},
                 )
-                return ExecutionResult(proposal_id=proposal.proposal_id, status="approval_rejected", capability_id=capability_id)
+                return ExecutionResult(
+                    proposal_id=proposal.proposal_id,
+                    status="approval_rejected",
+                    capability_id=capability_id,
+                    identity_assertion_id=identity_assertion_id,
+                )
             self.audit.append(
                 "approval_accepted",
                 {"proposal_id": proposal.proposal_id, "approval_id": approval.approval_id, "approver": approval.approver},
@@ -139,7 +195,12 @@ class TrustGateway:
                 "execution_failed",
                 {"proposal_id": proposal.proposal_id, "error": type(exc).__name__, "detail": str(exc)},
             )
-            return ExecutionResult(proposal_id=proposal.proposal_id, status="failed", capability_id=capability_id)
+            return ExecutionResult(
+                proposal_id=proposal.proposal_id,
+                status="failed",
+                capability_id=capability_id,
+                identity_assertion_id=identity_assertion_id,
+            )
 
         taints = self.tools.taints(proposal.tool, proposal.action, output)
         verified = self.tools.verify(proposal.tool, proposal.action, proposal.arguments, output)
@@ -153,6 +214,7 @@ class TrustGateway:
                 "verified": verified,
                 "output_taints": taints,
                 "capability_id": capability_id,
+                "identity_assertion_id": identity_assertion_id,
             },
         )
         return ExecutionResult(
@@ -162,6 +224,7 @@ class TrustGateway:
             verified=verified,
             output_taints=taints,
             capability_id=capability_id,
+            identity_assertion_id=identity_assertion_id,
         )
 
     def _validate_approval(self, proposal: ActionProposal, approval: Approval) -> str | None:
