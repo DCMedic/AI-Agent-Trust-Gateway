@@ -1,153 +1,136 @@
 # AI Agent Trust Gateway
 
-**Treat agent actions as untrusted proposals. Establish identity, verify policy provenance, constrain delegated authority, preserve information provenance, and require independent evidence before external effects are allowed.**
+**Treat agent actions as untrusted proposals. Preserve provenance, verify remote trust, constrain delegated authority, and require explicit evidence declassification before consequential cross-domain effects are allowed.**
 
-AI Agent Trust Gateway (AATG) is a runnable security reference architecture for placing an independent trust boundary between an AI agent and the tools, APIs, infrastructure, or cyber-physical systems it can affect.
+AI Agent Trust Gateway (AATG) is a runnable security reference architecture for placing an independent trust boundary between an AI agent and the tools, APIs, infrastructure, MCP servers, or cyber-physical systems it can affect.
 
-The project does not assume that a model is malicious. It assumes something operationally stronger: a useful model can still be wrong, manipulated by untrusted context, impersonated, overprivileged, replayed, or confidently mistaken about whether an external action succeeded.
+## v0.5 — Remote Trust & Declassification
 
-## v0.4 — Live MCP Adversarial Lab
-
-v0.4 adds a real Model Context Protocol transport boundary and an adversarial lab built against the stateless MCP `2026-07-28` protocol.
-
-The lab does not give an MCP server implicit trust simply because the server is reachable or because its tool metadata is syntactically valid. Server identity, tool schemas, output provenance, information flow, and downstream authority remain separate controls.
+v0.5 extends the live MCP adversarial lab into a cross-domain trust system. The central question is no longer only whether external information is tainted, but **under what independently reviewable conditions that information may become acceptable evidence for a consequential action**.
 
 ```text
-AI workload
-    |
-    v
-workload identity
-    |
-    v
-signed/versioned policy
-    |
-    v
-delegated capability
-    |
-    v
-risk budget + human approval
-    |
-    v
-durable execution reservation
-    |
-    v
-MCP / constrained tool boundary
-    |
-    +---- tool metadata --------> untrusted discovery evidence
-    |
-    +---- tool output ----------> tainted external evidence
-                                      |
-                                      v
-                              information-flow policy
-                                /                \
-                         low-risk analysis    medium/high effect
-                              allowed               blocked
-                                      |
-                                      v
-                         independent verification
-                                      |
-                                      v
-                           hash-chained audit trail
+remote MCP endpoint
+      |
+      v
+endpoint policy + HTTPS/auth requirements
+      |
+      v
+server/tool/schema pinning
+      |
+      v
+provenance-bearing evidence
+(source + trust domain + payload digest + taints)
+      |
+      v
+cross-domain information-flow policy
+      |                     \
+      | blocked              \ explicit declassification
+      v                       v
+low-risk analysis       reviewed evidence state
+                              |
+                              v
+identity + signed policy + capability + risk budget
+                              |
+                              v
+human approval / dual control
+                              |
+                              v
+durable execution reservation + constrained effect
 ```
 
 Passing one layer never grants permission to bypass another.
 
-## What v0.4 tests
+## New in v0.5
 
-The live lab starts an actual local HTTP MCP server process and drives it through JSON-RPC requests. The adversarial server can change behavior between test cases so the gateway can evaluate:
+### Remote endpoint trust policy
 
-- malicious tool descriptions containing instruction injection
-- prompt-injected tool output
-- MCP server impersonation
-- runtime tool-schema replacement
-- confused-deputy privilege escalation
-- cross-tool credential/exfiltration instructions
-- tainted external evidence attempting to parameterize high-impact actions
-- benign MCP calls that should remain usable for low-risk analysis
+`RemoteEndpointPolicy` binds a remote MCP endpoint to a trust domain and expected server identity. Remote endpoints require HTTPS by default and can attach an explicit bearer credential. Certificate SHA-256 pin helpers are included as a reference hook for deployments that need an additional server-certificate constraint.
 
-The objective is not to prove that prompt injection is solved. It is to test whether untrusted MCP content is prevented from silently acquiring authority over downstream effects.
+The reference bearer mechanism is intentionally simple. Production OAuth/OIDC deployments should validate issuer, audience, token binding, scopes, expiration, and authorization-server metadata using a mature identity stack. MCP `2026-07-28` hardened authorization around issuer validation and moved the ecosystem toward client metadata documents rather than Dynamic Client Registration.
 
-## Current MCP transport model
+### Evidence provenance
 
-`StatelessHTTPMCPClient` implements the subset of MCP `2026-07-28` needed by the lab:
+`EvidenceClaim` carries provenance into `ActionProposal`:
+
+- source identifier
+- source trust domain
+- payload digest
+- active taint labels
+- declassification grant IDs
+
+The complete evidence context and target trust domain are part of the proposal digest. A human approval therefore cannot be obtained under one evidence classification and silently reused after provenance changes.
+
+### Cross-domain information-flow control
+
+`InformationFlowPolicy` now considers both taint and domain. Low-risk observation remains available, while medium/high-risk effects fail closed when untrusted evidence crosses from one domain into another.
+
+Example:
+
+```text
+research MCP evidence -> operations service restart
+```
+
+is not authorized merely because the research server is authenticated or its response is syntactically valid.
+
+### Explicit declassification
+
+`DeclassificationAuthority` creates short-lived, signed grants bound to:
+
+- one exact evidence digest
+- a specific set of removable taints
+- one destination trust domain
+- a named reviewer
+- issuance and expiration time
+
+A grant changes information classification only. It **does not** grant tool permission, capability authority, risk budget, or human execution approval.
+
+This preserves a critical separation:
+
+> evidence may become acceptable for consideration without becoming authority to act.
+
+### Policy-differential evaluation
+
+`tools/evaluate_policy_differential.py` evaluates the same proposals under strict and deliberately permissive information-flow policies. CI verifies that weakening flow controls measurably changes the disposition of a high-impact MCP-derived proposal.
+
+That provides a concrete answer to: **what security property did the stricter policy actually buy us?**
+
+## MCP transport
+
+The live lab targets MCP `2026-07-28` and uses stateless HTTP JSON-RPC with MCP routing metadata. `StatelessHTTPMCPClient` supports the lab subset of:
 
 - `server/discover`
 - `tools/list`
 - `tools/call`
 
-Each request carries the MCP protocol version, request-routing headers, JSON-RPC correlation ID, and client metadata. The lab server is a separate process and communicates over HTTP rather than an in-process mock.
-
-The reference lab pins:
+The client preserves the v0.4 protections:
 
 - expected server identity
-- expected tool names
-- canonical SHA-256 digests of tool input schemas
+- pinned tool allowlist
+- canonical SHA-256 input-schema pins
+- suspicious tool-description classification
+- prompt-injection tainting
+- external-output provenance
 
-Tool **descriptions are never authorization inputs**. A malicious description can be surfaced and classified as suspicious without changing what the agent is permitted to do.
+Remote endpoint policy now adds HTTPS/authentication requirements and a trust-domain identity around that transport.
 
-The lab identity header is intentionally a research mechanism, not production authentication. Remote production MCP deployments should use appropriate TLS, authorization, workload identity, and server-authentication controls.
+## Core security invariants
 
-## Information-flow control
-
-AATG now explicitly separates information access from authority.
-
-MCP output receives conservative provenance labels such as:
-
-- `external_tool_output`
-- `unverified_tool_output`
-- `untrusted_mcp_content`
-- `prompt_injection_suspected`
-
-`InformationFlowPolicy` permits tainted content to remain available for low-risk inspection and analysis, but prevents those labels from directly flowing into medium- or high-risk effects.
-
-For example, an MCP search result can be shown to an analyst. The same result cannot directly become the justification or parameter source for a service restart simply because the tool text says to perform one.
-
-`ActionProposal.evidence_taints` is included in the proposal digest, so human approval cannot be obtained for one provenance state and then reused after that evidence context is changed.
-
-## Security invariants
-
-1. **Agents do not directly execute tools.** They submit structured action proposals.
-2. **Identity is not authorization.** Authentication never implies tool permission.
-3. **Policy is attributable.** Signed policy bundles identify the policy ID, version, key, and canonical digest used for a decision.
-4. **Delegation is scoped and revocable.** Capabilities cannot expand static policy.
-5. **Cumulative authority is bounded.** Risk budgets constrain sequences of individually legitimate actions.
-6. **High-impact approval is proposal-bound.** Approval is tied to the complete proposal digest.
-7. **Dual control is supported.** Critical configurations can require independent human approvers.
-8. **Approval replay protection is durable.** Consumed approval IDs survive restart.
-9. **External effects are reservation-bound.** Interrupted effects become `execution_in_doubt` rather than silently retrying.
-10. **MCP metadata is not authority.** Tool descriptions cannot grant capabilities or alter policy.
-11. **Tool schemas are pinned in the lab.** Runtime schema drift is detected before use.
-12. **External tool output remains tainted.** Successful transport does not establish truth or safety.
-13. **Tainted evidence cannot directly drive higher-risk effects.** Information flow is evaluated independently of tool execution.
-14. **Every security transition is auditable.** Identity, policy, capabilities, approvals, reservations, MCP provenance, denials, execution, and verification remain inspectable.
-
-## Durable authority and policy provenance
-
-v0.3 controls remain part of v0.4:
-
-- HMAC-signed reference workload identity
-- signed/versioned policy bundles
-- scoped HMAC capability tokens
-- SQLite-backed capability revocation
-- cumulative risk budgets
-- proposal-bound human approval
-- configurable dual-control quorum
-- SQLite-backed approval replay protection
-- SQLite execution reservations
-- `execution_in_doubt` recovery semantics
-- hash-chained audit records
-
-These are intentionally inspectable reference mechanisms. Production deployments should replace symmetric application secrets and local SQLite state with appropriate PKI/OIDC/SPIFFE identity, KMS/HSM-backed keys, strongly consistent shared state, remote immutable audit storage, and deployment isolation.
-
-## Live lab files
-
-```text
-src/trust_gateway/mcp_live.py          stateless MCP client + server/tool pinning
-src/trust_gateway/information_flow.py information-flow policy for tainted evidence
-tools/lab_mcp_server.py               adversarial MCP HTTP server
-tests/test_live_mcp_lab.py            transport/security regression suite
-lab/run_live_lab.py                    scored end-to-end live-lab evaluation
-```
+1. Agents submit proposals; they do not directly execute tools.
+2. Identity is distinct from authorization.
+3. Signed policy provenance identifies which policy authorized a decision.
+4. Capabilities are scoped, expiring, and revocable.
+5. Cumulative authority is bounded by risk budgets.
+6. Human approval is proposal-bound and replay protected.
+7. Critical configurations can require dual control.
+8. External effects are durably reservation-bound.
+9. MCP metadata never grants authority.
+10. Remote endpoint authentication does not make returned content trustworthy.
+11. Evidence carries source, trust domain, digest, and taint state.
+12. Cross-domain tainted evidence cannot directly drive medium/high-risk effects.
+13. Declassification is explicit, reviewer-bound, domain-bound, digest-bound, and expiring.
+14. Declassification changes information trust only; it cannot expand execution authority.
+15. Policy changes can be tested through differential evaluation.
+16. Security-relevant transitions remain auditable.
 
 ## Quick start
 
@@ -159,32 +142,32 @@ pytest
 python tools/run_scenarios.py
 python tools/evaluate_redteam.py
 python lab/run_live_lab.py
+python tools/evaluate_policy_differential.py
 uvicorn trust_gateway.app:app --reload
 ```
 
-Optional reference trust controls:
+## Key files
 
-```bash
-export AATG_IDENTITY_SECRET='development-identity-secret-at-least-32-bytes'
-export AATG_IDENTITY_KEY_ID='dev-identity-key'
-export AATG_CAPABILITY_SECRET='development-capability-secret-at-least-32-bytes'
-export AATG_HIGH_RISK_APPROVAL_QUORUM=2
+```text
+src/trust_gateway/mcp_live.py          MCP 2026-07-28 client, server/tool/schema trust
+src/trust_gateway/remote_trust.py      remote endpoint, HTTPS/auth, certificate-pin policy
+src/trust_gateway/information_flow.py cross-domain information-flow rules
+src/trust_gateway/declassification.py signed evidence declassification grants
+src/trust_gateway/models.py           evidence provenance carried in proposals
+tests/test_v05_remote_trust.py        v0.5 security regression tests
+tools/evaluate_policy_differential.py strict-vs-permissive policy experiment
+lab/run_live_lab.py                    live MCP adversarial evaluation
 ```
 
-Signed policy enforcement can additionally be enabled with `AATG_POLICY_PATH`, `AATG_POLICY_KEY_ID`, `AATG_POLICY_SECRET`, and `AATG_REQUIRE_SIGNED_POLICY=true`.
+## Evaluation
 
-## Adversarial evaluation
+CI runs the security regression suite, core adversarial scenarios, the scored red-team corpus, the live MCP adversarial lab, and the v0.5 policy-differential experiment.
 
-CI executes four complementary layers:
+The evaluation remains deterministic and intentionally bounded. Passing it demonstrates regression resistance for the documented threat cases; it does not prove general model alignment or universal prompt-injection resistance.
 
-1. the complete pytest security regression suite
-2. readable core adversarial scenarios
-3. the scored general red-team corpus
-4. the live MCP adversarial lab
+## Production evolution
 
-The live-lab report uses schema `aatg.mcp-live-lab.v2` and reports its protocol version, individual cases, pass count, total cases, and containment rate. CI fails if a reference live-lab case is not contained as expected.
-
-The lab is intentionally deterministic. It is a reproducible regression boundary, not evidence that arbitrary agent behavior or arbitrary MCP servers are safe.
+A hardened implementation should replace reference mechanisms with mature infrastructure, including asymmetric/KMS-backed signing, SPIFFE/OIDC/mTLS workload identity, standards-compliant OAuth/OIDC validation, managed PKI and certificate rotation, strongly consistent shared replay/risk state, immutable remote audit storage, adapter isolation, egress controls, and organizational approval/declassification workflows.
 
 ## Documentation
 
@@ -194,15 +177,19 @@ The lab is intentionally deterministic. It is a reproducible regression boundary
 
 ## Research direction
 
-AATG asks a narrow but important question:
+AATG now asks two linked questions:
 
-> **When an AI system requests an external effect, what independent evidence of identity, authority, provenance, policy, intent, and resulting state should exist before that effect is trusted?**
+> **What authority should an AI system possess over external effects?**
 
-Potential next milestones include authenticated remote MCP endpoints, OAuth/OIDC authorization evaluation, certificate/server attestation, explicit declassification workflows, durable distributed risk budgets, policy differential testing, multi-server cross-domain information-flow controls, and a larger reproducible adversarial corpus.
+and
+
+> **What evidence is trustworthy enough to influence those effects, and who is allowed to change that classification?**
+
+Future work includes full OAuth/OIDC issuer validation, proof-of-possession credentials, certificate transparency/attestation experiments, durable declassification ledgers, multi-reviewer declassification, provenance graphs, distributed risk accounting, and larger cross-server attack corpora.
 
 ## Scope
 
-AATG is a research and portfolio project, not a production authorization product. It does not prove that a model is aligned, truthful, or non-deceptive, and it is not a substitute for production identity, policy, secrets management, sandboxing, egress control, durable distributed state, or infrastructure isolation.
+AATG is a research and portfolio project, not a production authorization product. It does not prove that a model is aligned, truthful, or non-deceptive, and it is not a substitute for production identity, authorization, policy, secrets management, sandboxing, egress control, or infrastructure isolation.
 
 ## License
 
