@@ -2,163 +2,138 @@
 
 ## Design principle
 
-The gateway treats model output as a **proposal**, not an instruction with inherent authority.
+AATG treats model output as a **proposal**, never as authority. v0.3 additionally treats policy provenance and execution state as security evidence that must survive ordinary process failure.
 
-The v0.2 execution path deliberately decomposes identity, authority, cumulative impact, and evidence:
+## v0.3 execution path
 
-1. verify the proposing workload identity when identity enforcement is enabled
+1. verify workload identity when enabled
 2. parse a structured `ActionProposal`
-3. evaluate explicit static policy
-4. validate arguments against policy constraints
-5. classify risk
-6. validate short-lived delegated capability authority for medium/high-risk actions when enabled
-7. enforce the agent's sliding-window cumulative risk budget
-8. require proposal-bound, single-use human approval when policy demands it
-9. invoke only a registered constrained adapter
-10. label returned data with provenance/taint information
-11. independently verify the resulting state
-12. persist tamper-evident audit events
+3. verify signed policy provenance when signed-policy enforcement is enabled
+4. evaluate policy and bind policy ID/version/digest/key ID to the decision
+5. validate delegated capability authority for medium/high-risk actions when enabled
+6. enforce cumulative risk budget
+7. validate proposal-bound human approval and optional independent-approver quorum
+8. atomically reserve the proposal in durable execution state
+9. durably consume approval IDs
+10. consume risk budget
+11. invoke only a registered constrained adapter
+12. preserve result provenance/taint
+13. independently verify resulting state
+14. mark execution terminal and append security events to the hash-chained audit journal
 
-No step relies on the model's confidence or natural-language justification as an authorization primitive.
+No step uses model confidence, chain-of-thought, or natural-language justification as an authorization primitive.
 
-## Trust and authority decomposition
-
-AATG intentionally keeps identity, static permission, delegated authority, cumulative impact, and human authorization separate.
+## Authority decomposition
 
 ### Workload identity
 
-`WorkloadIdentity` verifies a signed assertion containing subject, audience, key ID, assertion ID, issuance time, and expiration. When configured, the assertion subject must match the proposal's `agent_id` before execution proceeds.
+`WorkloadIdentity` establishes which reference workload is presenting a proposal. Authentication does not imply authorization.
 
-The reference implementation uses HMAC-SHA256 to keep the mechanism inspectable and dependency-light. A production deployment should replace it with an external workload identity system such as SPIFFE/SPIRE, cloud OIDC workload identity, or mTLS certificates backed by managed PKI.
+### Signed policy provenance
 
-### Static policy
+`PolicyBundleVerifier` verifies `aatg.policy-bundle.v1`. A verified bundle supplies a policy ID, version, signing key ID, issue time, canonical SHA-256 digest, and signature. `PolicyEngine` copies that provenance into every `PolicyDecision`, which is then persisted by the audit journal.
 
-`PolicyEngine` answers whether an agent class is permitted to request a tool/action at all. Unknown agents, tools, actions, and parameter shapes fail closed.
+The HMAC implementation is intentionally dependency-light. Production policy signing should use asymmetric signatures or KMS/HSM-backed signing so policy-verification nodes do not also hold signing authority.
 
 ### Delegated capability
 
-`CapabilityIssuer` creates short-lived HMAC-SHA256 capability tokens. A token is bound to a subject, audience, tool, action, expiration, unique capability ID, and optional argument constraints.
-
-A capability cannot expand static policy. Both checks must pass.
+`CapabilityIssuer` constrains delegated authority by subject, audience, tool, action, expiration, ID, and optional parameter envelope. `SQLiteCapabilityRevocationList` allows a capability to be durably revoked before natural expiration.
 
 ### Cumulative risk budget
 
-`RiskBudget` assigns cumulative impact costs to risk tiers and maintains a sliding window per agent. The reference costs are low=0, medium=1, high=3. This limits sequences of individually permitted actions that collectively exceed the intended authority envelope.
+`RiskBudget` limits the amount of medium/high-risk authority exercised by one agent inside a sliding window. The current state remains in-memory and is explicitly not a distributed accounting mechanism.
 
-### Human approval
+### Human approval and dual control
 
-High-risk actions can require a human decision bound to the canonical SHA-256 digest of one exact proposal. The `ApprovalLedger` makes accepted approvals single use.
+Human approval is bound to the exact proposal digest. `high_risk_approval_quorum` may require multiple distinct approver identities. `SQLiteApprovalLedger` durably prevents approval replay across process restarts.
 
-A human approval cannot expand policy or capability scope. It authorizes one already-policy-compliant proposal to proceed.
+### Durable execution reservation
 
-## Components
+`SQLiteExecutionLedger` atomically reserves the proposal ID and digest before approval/risk authority is consumed and before the adapter is invoked.
 
-### Action proposal model
+A duplicate reservation is never silently retried. If the existing record remains `reserved`, AATG returns `execution_in_doubt`. If it is already terminal, the duplicate returns `execution_replay_blocked`.
 
-A typed request containing agent identity, tool, action, arguments, declared purpose, proposal ID, and timestamp. A canonical SHA-256 digest binds human approval to the exact request.
+This implements **at-most-once intent at the gateway boundary**, not proof of exactly-once effects in an external system. Exactly-once semantics generally require cooperation from the target system, such as idempotency keys or transactional APIs.
 
-### Policy decision point
+## Crash semantics
 
-`PolicyEngine` loads a declarative JSON policy. Rules constrain argument names, required values, string lengths, enumerated values, risk tier, and approval requirements.
+The critical failure window is between authorization and observable completion.
 
-### Capability verifier
+```text
+VALIDATED
+   |
+   v
+RESERVE PROPOSAL  ----duplicate----> REPLAY_BLOCKED / IN_DOUBT
+   |
+   v
+CONSUME AUTHORITY
+   |
+   v
+EXECUTE TOOL
+   |          \
+ crash         success/failure
+   |                |
+   v                v
+RESERVED        TERMINAL
+IN_DOUBT
+```
 
-The capability layer represents explicitly delegated authority. It validates signature, audience, subject, tool/action scope, expiration, and optional argument constraints before a medium/high-risk action can proceed when capability enforcement is enabled.
-
-### Approval control
-
-High-risk approval includes the exact proposal digest, human approver identity, expiration, and approval ID. Once accepted, its ID is consumed. A modified, expired, or replayed approval fails closed.
-
-### Tool registry
-
-Adapters are explicitly registered. The reference implementation does not expose shell execution, arbitrary HTTP requests, filesystem traversal, or dynamic import as agent tools.
-
-### MCP adapter boundary
-
-`MCPToolAdapter` models an MCP-style external tool boundary. Authorization stays in the gateway. The adapter transports an already-approved request, marks the result as external tool output, and fails verification closed when no independent verifier exists.
-
-### Provenance and taint tracking
-
-Tool output begins as `unverified_tool_output`. Verification can remove that particular label but does not erase unrelated provenance. For example, a verified database read may still be labeled `stored_user_content`, because successful retrieval is not evidence that the content itself is truthful or safe.
-
-### Verification layer
-
-Tool invocation and outcome verification are separate. A production adapter should verify using evidence meaningfully independent of the command path whenever possible.
-
-### Audit journal
-
-Security-relevant transitions are written as JSONL records linked by SHA-256 hashes. This is tamper-evident, not tamper-proof; production deployment should write to separately protected append-only storage and preferably sign events.
+If the process crashes after reservation, a restart does not know whether the external effect happened. Retrying could duplicate a high-impact action, so the gateway fails safe and requires reconciliation against independent external state.
 
 ## Security state machine
 
 ```text
 REQUEST
-   |
-   v
-IDENTITY_CHECK ----missing/invalid----> DENIED
-   |
-   v
-POLICY_EVALUATED ----deny-------------> DENIED
-   |
-   v
-CAPABILITY_CHECK ----invalid/missing--> DENIED / CAPABILITY_REQUIRED
-   |
-   v
-RISK_BUDGET_CHECK ----exceeded--------> DENIED
-   |
-   +----allow---------------------------> EXECUTING
-   |
-   +----approval required-----> PENDING_APPROVAL
-                                  |
-                       mismatch/expired/replay
-                                  |
-                                  v
-                                DENIED
-                                  |
-                              fresh approval
-                                  v
-                              EXECUTING
-                                  |
-                         adapter success/fail
-                         /                \
-                    FAILED            TAINTED_RESULT
-                                         |
-                                      VERIFYING
-                                         |
-                              verified / not verified
-                               /                 \
-                         COMPLETED      VERIFICATION_FAILED
+  |
+IDENTITY_CHECK --------invalid--------> DENIED
+  |
+POLICY_VERIFY/EVALUATE -tampered/deny-> DENIED
+  |
+CAPABILITY_CHECK ------invalid--------> DENIED
+  |
+RISK_BUDGET_CHECK -----exceeded-------> DENIED
+  |
+APPROVAL/QUORUM -------invalid--------> DENIED
+  |
+EXECUTION_RESERVE -----duplicate------> REPLAY_BLOCKED / IN_DOUBT
+  |
+AUTHORITY_CONSUMED
+  |
+TOOL_EXECUTION --------error----------> FAILED
+  |
+TAINTED_RESULT
+  |
+INDEPENDENT_VERIFY ----not verified---> VERIFICATION_FAILED
+  |
+COMPLETED
 ```
 
-## Why identity is not authorization
+## Why policy provenance matters
 
-A cryptographically valid assertion proves only that the caller controls the credential for the stated workload identity. It does not grant permission to use a tool. Static policy, delegated capabilities, risk budget, and human approval remain separate gates. This prevents the common mistake of treating authentication as blanket authority.
+A policy engine that only returns `allow` or `deny` cannot later prove which rule set produced the decision. v0.3 records a cryptographic digest and version with every decision, making policy changes part of the evidence chain and enabling future policy-differential analysis.
 
-## Why approval is digest-bound and single-use
+## Why reservation precedes authority consumption
 
-A generic approval such as "allow the agent to restart a service" is vulnerable to ambiguity, bait-and-switch changes, and replay. AATG instead approves a digest of the entire proposal. If the agent changes the service, argument set, stated purpose, ID, or timestamp, the digest changes and the approval no longer matches. After a matching approval is accepted, its ID is consumed so the same human decision cannot silently authorize repeated execution.
+If approvals were consumed before any durable execution marker existed, a process could crash and leave a consumed human decision with no durable statement about whether execution began. Reserving first establishes an observable boundary before consumable authority changes state.
 
-## Why cumulative risk budgets exist
+## Reference persistence model
 
-Per-action authorization alone misses sequence risk. An agent could perform many medium-risk writes or repeated high-risk administrative actions that are each locally legitimate but collectively excessive. The sliding-window risk budget adds a second question: **even if this action is individually authorized, has this agent already exercised too much authority recently?**
+The API uses SQLite for approval replay state, capability revocations, and execution reservations. SQLite provides durable single-node uniqueness and atomic inserts suitable for a reference architecture.
 
-## Research evaluation
-
-`tools/evaluate_redteam.py` runs a labeled corpus of benign and adversarial cases and reports separate metrics for adversarial containment and benign completion. CI fails when either reference metric falls below 100 percent. The current corpus is intentionally small; its purpose is to establish an evaluation interface that can grow into a larger reproducible benchmark.
+Production multi-replica deployments require a shared, strongly consistent authority datastore, explicit transaction design, backup/recovery policy, and controls for split brain and stale replicas.
 
 ## Production evolution
 
-A hardened implementation should replace demonstration components with:
+A hardened implementation should add:
 
-- external workload identity backed by PKI/OIDC/SPIFFE-like infrastructure
-- asymmetric or KMS/HSM-backed identity and capability signing, rotation, and revocation
-- durable approval workflows with strong human identity and optional dual control
-- durable risk-budget state and distributed replay protection
-- external policy decision points or formally versioned policy bundles
-- remote immutable audit storage and signed events
-- process/container isolation for adapters
-- outbound network allowlists and egress policy
-- transaction boundaries and compensating actions
-- independent state/evidence providers
-- information-flow policy for tainted outputs
-- larger adversarial-evaluation datasets and policy differential testing
+- asymmetric/KMS-backed policy, identity, and capability signing
+- external workload identity such as SPIFFE/SPIRE or managed OIDC/mTLS
+- durable distributed risk budgets
+- strongly consistent multi-replica replay state
+- explicit recovery workflow for `execution_in_doubt`
+- target-system idempotency keys or transaction support
+- immutable remotely signed audit storage
+- container/process isolation and egress controls for adapters
+- live authenticated MCP transport
+- information-flow enforcement for tainted results
+- policy differential testing and a larger adversarial benchmark
