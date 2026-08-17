@@ -22,7 +22,6 @@ class PolicyEngine:
         raw = json.loads(self.policy_path.read_text(encoding="utf-8"))
         self.provenance: PolicyProvenance | None = None
         self.information_flow = information_flow or InformationFlowPolicy()
-
         if raw.get("schema") == "aatg.policy-bundle.v1":
             if verifier is None:
                 raise ValueError("policy_bundle_verifier_required")
@@ -45,40 +44,35 @@ class PolicyEngine:
         )
 
     def evaluate(self, proposal: ActionProposal) -> PolicyDecision:
-        agents = self.policy.get("agents", {})
-        agent = agents.get(proposal.agent_id)
+        agent = self.policy.get("agents", {}).get(proposal.agent_id)
         if agent is None:
             return self._decision(Decision.DENY, RiskTier.HIGH, ["unknown_agent"])
-
         tool_rules = agent.get("tools", {}).get(proposal.tool)
         if tool_rules is None:
             return self._decision(Decision.DENY, RiskTier.HIGH, ["tool_not_authorized"])
-
         action_rule = tool_rules.get(proposal.action)
         if action_rule is None:
             return self._decision(Decision.DENY, RiskTier.HIGH, ["action_not_authorized"])
 
-        constraint_errors = self._validate_constraints(
-            proposal.arguments,
-            action_rule.get("constraints", {}),
-        )
+        constraint_errors = self._validate_constraints(proposal.arguments, action_rule.get("constraints", {}))
         risk = RiskTier(action_rule.get("risk", "high"))
         if constraint_errors:
             return self._decision(Decision.DENY, risk, constraint_errors)
 
-        if proposal.evidence_taints:
-            flow = self.information_flow.evaluate(proposal.evidence_taints, risk)
+        taints = proposal.all_evidence_taints()
+        if taints or proposal.evidence:
+            flow = self.information_flow.evaluate(
+                taints,
+                risk,
+                source_domains=proposal.source_domains(),
+                target_domain=proposal.target_trust_domain,
+            )
             if not flow.allowed:
                 reasons = [reason.replace("blocked_taint:", "tainted_evidence_blocked:") for reason in flow.reasons]
                 return self._decision(Decision.DENY, risk, reasons)
 
         if action_rule.get("requires_approval", False):
-            return self._decision(
-                Decision.REQUIRE_APPROVAL,
-                risk,
-                ["human_approval_required"],
-            )
-
+            return self._decision(Decision.REQUIRE_APPROVAL, risk, ["human_approval_required"])
         return self._decision(Decision.ALLOW, risk, ["policy_authorized"])
 
     @staticmethod
@@ -86,25 +80,18 @@ class PolicyEngine:
         errors: list[str] = []
         allowed_keys = set(constraints.get("allowed_keys", []))
         required_keys = set(constraints.get("required_keys", []))
-
         if allowed_keys:
             unexpected = set(arguments) - allowed_keys
             if unexpected:
                 errors.append(f"unexpected_arguments:{','.join(sorted(unexpected))}")
-
         missing = required_keys - set(arguments)
         if missing:
             errors.append(f"missing_arguments:{','.join(sorted(missing))}")
-
-        max_lengths = constraints.get("max_lengths", {})
-        for key, maximum in max_lengths.items():
+        for key, maximum in constraints.get("max_lengths", {}).items():
             value = arguments.get(key)
             if isinstance(value, str) and len(value) > int(maximum):
                 errors.append(f"argument_too_long:{key}")
-
-        allowed_values = constraints.get("allowed_values", {})
-        for key, values in allowed_values.items():
+        for key, values in constraints.get("allowed_values", {}).items():
             if key in arguments and arguments[key] not in values:
                 errors.append(f"argument_value_denied:{key}")
-
         return errors
