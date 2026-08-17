@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
 import secrets
-from typing import Any
+from threading import Lock
+from typing import Any, Protocol
 
 
 class CapabilityError(ValueError):
@@ -21,6 +22,32 @@ def _b64(data: bytes) -> str:
 def _unb64(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode(value + padding)
+
+
+class RevocationStore(Protocol):
+    def is_revoked(self, capability_id: str) -> bool: ...
+
+    def revoke(self, capability_id: str) -> None: ...
+
+
+@dataclass
+class CapabilityRevocationList:
+    """Thread-safe reference revocation store.
+
+    A production deployment should persist revocations in a shared datastore or
+    use short-lived capabilities plus a centrally managed signing/key lifecycle.
+    """
+
+    revoked_ids: set[str] = field(default_factory=set)
+    _lock: Lock = field(default_factory=Lock, repr=False)
+
+    def is_revoked(self, capability_id: str) -> bool:
+        with self._lock:
+            return capability_id in self.revoked_ids
+
+    def revoke(self, capability_id: str) -> None:
+        with self._lock:
+            self.revoked_ids.add(capability_id)
 
 
 @dataclass(frozen=True)
@@ -38,11 +65,17 @@ class CapabilityClaims:
 class CapabilityIssuer:
     """Minimal HMAC capability tokens for constraining delegated agent authority."""
 
-    def __init__(self, secret: bytes, audience: str = "ai-agent-trust-gateway"):
+    def __init__(
+        self,
+        secret: bytes,
+        audience: str = "ai-agent-trust-gateway",
+        revocations: RevocationStore | None = None,
+    ):
         if len(secret) < 32:
             raise ValueError("capability_secret_too_short")
         self.secret = secret
         self.audience = audience
+        self.revocations = revocations
 
     def issue(
         self,
@@ -68,7 +101,16 @@ class CapabilityIssuer:
         signature = _b64(hmac.new(self.secret, body.encode(), hashlib.sha256).digest())
         return f"{body}.{signature}"
 
-    def verify(self, token: str) -> CapabilityClaims:
+    def revoke(self, token_or_id: str) -> str:
+        if self.revocations is None:
+            raise CapabilityError("capability_revocation_unavailable")
+        capability_id = token_or_id
+        if "." in token_or_id:
+            capability_id = self.verify(token_or_id, check_revocation=False).jti
+        self.revocations.revoke(capability_id)
+        return capability_id
+
+    def verify(self, token: str, *, check_revocation: bool = True) -> CapabilityClaims:
         try:
             body, signature = token.split(".", 1)
         except ValueError as exc:
@@ -87,8 +129,11 @@ class CapabilityIssuer:
             raise CapabilityError("capability_audience_mismatch")
         if expires_at <= now:
             raise CapabilityError("capability_expired")
+        capability_id = payload["jti"]
+        if check_revocation and self.revocations is not None and self.revocations.is_revoked(capability_id):
+            raise CapabilityError("capability_revoked")
         return CapabilityClaims(
-            jti=payload["jti"],
+            jti=capability_id,
             subject=payload["sub"],
             audience=payload["aud"],
             tool=payload["tool"],
