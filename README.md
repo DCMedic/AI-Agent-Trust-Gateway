@@ -6,17 +6,31 @@ AI Agent Trust Gateway (AATG) is a security reference architecture and runnable 
 
 The gateway does **not** assume that a model is malicious. It assumes something more operationally useful: a model can be wrong, manipulated, overconfident, compromised by untrusted context, or granted more authority than a particular task requires.
 
+## v0.2 trust model
+
+AATG v0.2 separates three different kinds of authority that are often collapsed into one in agent systems:
+
+1. **Static policy** answers whether an agent class is ever permitted to propose an action.
+2. **Capability authority** delegates short-lived, cryptographically signed permission for a specific agent/tool/action/argument envelope.
+3. **Human approval** authorizes one exact high-impact proposal and is consumed after one use.
+
+Passing one layer does not bypass the others. A high-risk action can therefore require policy permission, a valid capability, and a fresh human approval before execution.
+
 ## Security invariants
 
 1. **No direct tool execution.** Agents submit action proposals; only the gateway invokes tools.
 2. **Default deny.** Unknown agents, tools, actions, and argument patterns are rejected.
-3. **Least authority.** Authorization is evaluated per agent, tool, action, and risk tier.
-4. **High-impact actions require approval.** Human approval is bound to the exact proposal digest and expires.
-5. **Argument constraints are enforced.** Permission to use a tool is not blanket permission to use every parameter.
-6. **Policy is evaluated before execution.** Tool adapters cannot bypass the decision point.
-7. **Every decision is auditable.** Proposal, decision, approval, execution, denial, and verification events are written to a hash-chained journal.
-8. **Tool output is not automatically trusted.** Post-execution verification is a separate step.
-9. **Failures fail closed.** Policy, approval, adapter, or verification errors do not silently become success.
+3. **Least authority.** Authorization is evaluated per agent, tool, action, argument envelope, and risk tier.
+4. **Delegation is explicit.** Medium/high-risk authority can be represented by short-lived HMAC-signed capabilities.
+5. **Capabilities are scoped.** Tokens are bound to subject, audience, tool, action, expiration, and optional argument constraints.
+6. **High-impact actions require human approval.** Approval is bound to the exact proposal digest and expires.
+7. **Approvals are single use.** Replaying an already consumed approval is blocked and audited.
+8. **Argument constraints are enforced twice.** Static policy and delegated capability constraints can independently restrict parameters.
+9. **Policy is evaluated before execution.** Tool adapters cannot bypass the decision point.
+10. **Every decision is auditable.** Proposal, policy, capability, approval, execution, denial, replay, and verification events are written to a hash-chained journal.
+11. **Tool output is not automatically trusted.** Results carry provenance/taint labels until independent verification resolves what it actually can prove.
+12. **Verification does not erase provenance.** A verified result can still remain tainted as stored user content, simulated state, or external tool output.
+13. **Failures fail closed.** Policy, capability, approval, adapter, or verification errors do not silently become success.
 
 ## Architecture
 
@@ -25,42 +39,69 @@ The gateway does **not** assume that a model is malicious. It assumes something 
         |
         | ActionProposal
         v
-+-----------------------+
-|  AI Agent Trust       |
-|  Gateway              |
-|                       |
-|  identity             |
-|  policy evaluation    |
-|  argument constraints |
-|  risk classification  |
-|  approval binding     |
-|  audit journal        |
-+-----------+-----------+
-            |
-      authorized action
-            v
-+-----------------------+
-| Constrained tool      |
-| adapters              |
-+-----------+-----------+
-            |
-       tool result
-            v
-+-----------------------+
-| Independent result /  |
-| state verification    |
-+-----------------------+
++----------------------------+
+| AI Agent Trust Gateway     |
+|                            |
+| static policy              |
+| capability verification    |
+| argument constraints       |
+| risk classification        |
+| single-use approval ledger |
+| hash-chained audit journal |
++-------------+--------------+
+              |
+       authorized action
+              v
++----------------------------+
+| constrained adapters       |
+| local / API / MCP boundary |
++-------------+--------------+
+              |
+        tainted result
+              v
++----------------------------+
+| independent verification   |
+| + provenance preservation  |
++----------------------------+
 ```
+
+## Capability tokens
+
+`CapabilityIssuer` implements a deliberately small reference capability format using HMAC-SHA256. Each token contains a unique identifier, subject, audience, tool, action, issuance/expiration time, and optional argument constraints.
+
+Capabilities are **delegated authority**, not authentication by themselves. Production deployments should bind issuance to a mature workload identity system, KMS/HSM-protected signing keys, rotation, revocation, and durable replay controls.
+
+## Human approvals
+
+High-risk approval is intentionally narrower than "approve this agent." An `Approval` is bound to the SHA-256 digest of one exact proposal, including its tool, action, arguments, purpose, identity, and creation time.
+
+v0.2 adds a single-use approval ledger. Once accepted for execution, the approval ID is consumed. Reusing it is treated as a replay attempt and produces an audit event.
+
+## Output taint tracking
+
+AATG distinguishes **execution success** from **information trust**. Tool results begin as `unverified_tool_output`. Independent verification may remove that specific label, but other provenance labels remain.
+
+Examples:
+
+- `stored_user_content` means the gateway verified the read operation, not the truth of the content.
+- `simulated_effect` means the reference adapter verified simulated state, not a real external system.
+- `external_tool_output` marks MCP-style data as externally supplied evidence until an independent verifier validates it.
+
+This prevents a common trust-collapse error: treating "the tool returned this successfully" as equivalent to "this information is safe to trust for downstream decisions."
+
+## MCP-style adapter boundary
+
+`MCPToolAdapter` provides a small protocol boundary for MCP-like tools. Authorization remains outside the adapter. The adapter transports only an already-authorized call, labels the response as external tool output, and fails verification closed when no independent verifier is configured.
+
+The current adapter is intentionally transport-agnostic so the security model can be evaluated independently of a specific MCP client library.
 
 ## Current reference tools
 
-The initial implementation intentionally uses safe local adapters rather than giving a demonstration agent shell or arbitrary network access:
+The reference implementation intentionally uses safe local adapters rather than giving a demonstration agent shell or arbitrary network access:
 
 - `notes.read` — low-risk read operation
-- `notes.append` — bounded write operation
-- `service.restart` — simulated high-impact administrative operation requiring human approval
-
-The architecture is designed so real adapters can later implement APIs, MCP tools, infrastructure operations, cyber-physical commands, or other agent capabilities without moving authorization logic into the model.
+- `notes.append` — bounded medium-risk write; capability required when capability enforcement is enabled
+- `service.restart` — simulated high-impact administrative operation requiring capability + human approval
 
 ## Quick start
 
@@ -69,41 +110,39 @@ python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 pytest
+python tools/run_scenarios.py
 uvicorn trust_gateway.app:app --reload
 ```
 
-Then visit `http://127.0.0.1:8000/docs`.
+To enable capability enforcement in the API process, set a secret of at least 32 bytes:
 
-## Example proposal
-
-```json
-{
-  "agent_id": "research-agent",
-  "tool": "notes",
-  "action": "append",
-  "arguments": {"text": "Candidate finding"},
-  "purpose": "Store a research note"
-}
+```bash
+export AATG_CAPABILITY_SECRET='replace-with-a-development-secret-of-at-least-32-bytes'
 ```
 
-The model does not decide whether this request is authorized. It proposes the action. The gateway independently evaluates policy and records the decision.
+Do not use an application environment variable as the long-term signing-key strategy for a production deployment.
 
 ## Adversarial evaluation
 
-`tools/run_scenarios.py` exercises cases including:
+The regression suite and scenario harness exercise cases including:
 
 - unknown agent requesting a tool
 - known agent attempting an unauthorized action
 - argument-constraint violation
+- missing delegated capability
+- capability subject/scope mismatch
+- capability argument expansion
+- capability tampering and expiration
 - high-impact action without approval
-- approval replay against a modified proposal
+- approval bound to a modified proposal
+- single-use approval replay
 - expired approval
-- authorized low-risk action
-- approved high-risk action
-- simulated tool failure
+- tool failure
+- tainted output that remains tainted after execution verification
+- MCP output without an independent verifier
 - audit-chain integrity validation
 
-The objective is not merely to demonstrate successful agent behavior; it is to demonstrate that unsafe or ambiguous behavior is contained.
+The objective is not merely to demonstrate successful agent behavior. The project is designed to make unsafe, ambiguous, over-privileged, and replayed behavior observable and containable.
 
 ## Documentation
 
@@ -117,11 +156,11 @@ This project explores a central question in trustworthy agentic systems:
 
 > **How much authority should an AI system possess directly, and what evidence should be required before its requested actions are allowed to produce external effects?**
 
-Future milestones include cryptographically signed agent identities, policy provenance, dual-control approvals, budget/rate constraints, MCP adapters, output taint tracking, independent verification providers, policy differential testing, and red-team evaluation datasets.
+Next research milestones include durable capability revocation, cryptographic workload identity, risk budgets, dual-control approval, live MCP integration, information-flow policy, independent verification providers, policy differential testing, and a scored red-team evaluation corpus.
 
 ## Scope
 
-AATG is a research and portfolio project. It is not a production authorization product and should not be treated as a substitute for mature identity, secrets-management, policy, sandboxing, and infrastructure-security controls.
+AATG is a research and portfolio project. It is not a production authorization product and should not be treated as a substitute for mature identity, secrets management, policy, sandboxing, network isolation, and infrastructure-security controls.
 
 ## License
 
